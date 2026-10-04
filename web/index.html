@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="icon" href="data:," />
+    <title>OrthoPan</title>
+    <style>
+      :root {
+        --tree-w: 220px;
+        --label-w: 170px;
+        --track-h: 68px;
+        --border: #d0d5dd;
+        --panel: #f8fafc;
+      }
+      * { box-sizing: border-box; }
+      html, body { margin: 0; height: 100%; overflow: hidden;
+        font: 12px/1.35 system-ui, -apple-system, Segoe UI, sans-serif; color: #1f2937; }
+      #app { display: flex; flex-direction: column; height: 100%; }
+
+      #topbar { display: flex; align-items: center; gap: 10px; padding: 6px 10px;
+        border-bottom: 1px solid var(--border); background: var(--panel); z-index: 5; }
+      #topbar h1 { font-size: 13px; margin: 0 8px 0 0; font-weight: 600; }
+      #topbar label { color: #475467; }
+      #topbar select, #topbar button { font: inherit; padding: 3px 6px; }
+      #topbar button { cursor: pointer; }
+      #status { margin-left: auto; color: #667085; white-space: nowrap; }
+      #notice { color: #b54708; white-space: nowrap; max-width: 40ch; overflow: hidden; text-overflow: ellipsis; }
+      #legend { display: inline-block; width: 110px; height: 10px; border: 1px solid var(--border);
+        vertical-align: middle; border-radius: 2px; }
+      #sortbtn { display: none; }
+      #sortbtn.visible { display: inline-block; }
+
+      #body { display: flex; flex: 1; min-height: 0; position: relative; }
+      #tree-col { width: var(--tree-w); flex: 0 0 var(--tree-w); position: relative;
+        border-right: 1px solid var(--border); }
+      #tree-col canvas { position: absolute; left: 0; right: 0; top: var(--track-h); bottom: 0;
+        width: 100%; height: calc(100% - var(--track-h)); }
+      #tree-spacer { height: var(--track-h); border-bottom: 1px solid var(--border); }
+
+      #center { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+      #tracks { height: var(--track-h); flex: 0 0 var(--track-h); position: relative;
+        border-bottom: 1px solid var(--border); }
+      #tracks canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+      #matrix-wrap { position: relative; flex: 1; min-height: 0; overflow: hidden; }
+      #deck { position: absolute; inset: 0; }
+      #overlay { position: absolute; inset: 0; pointer-events: none; }
+      #tooltip { position: absolute; pointer-events: none; display: none; z-index: 10;
+        background: rgba(17,24,39,0.92); color: #f9fafb; padding: 5px 7px; border-radius: 4px;
+        font-size: 11px; max-width: 320px; white-space: nowrap; }
+      #tooltip b { color: #93c5fd; font-weight: 600; }
+
+      #labels-col { width: var(--label-w); flex: 0 0 var(--label-w); position: relative;
+        border-left: 1px solid var(--border); }
+      #labels-col.collapsed { width: 14px; flex: 0 0 14px; }
+      #labels-col canvas { position: absolute; left: 0; right: 0; top: var(--track-h); bottom: 0;
+        width: 100%; height: calc(100% - var(--track-h)); }
+      #labels-spacer { height: var(--track-h); border-bottom: 1px solid var(--border); }
+
+      /* overlay the matrix side only: the label column stays visible as the panel's right edge */
+      #panel { position: absolute; top: 0; right: var(--label-w); bottom: 0; width: 340px;
+        background: #fff; border-left: 1px solid var(--border); box-shadow: -4px 0 12px rgba(0,0,0,0.08);
+        overflow: auto; padding: 10px 12px; display: none; z-index: 20; }
+      #panel.visible { display: block; }
+      #panel h2 { font-size: 13px; margin: 0 0 6px; }
+      #panel .close { float: right; cursor: pointer; border: none; background: none; font-size: 16px; }
+      #panel table { border-collapse: collapse; width: 100%; margin: 6px 0; }
+      #panel td { padding: 2px 4px; border-bottom: 1px solid #eef2f6; vertical-align: top; }
+      #panel td:first-child { color: #667085; white-space: nowrap; }
+      #panel ul { margin: 4px 0 0; padding-left: 16px; max-height: 40%; overflow: auto; }
+      #panel code { background: #f2f4f7; padding: 0 3px; border-radius: 3px; }
+    </style>
+  </head>
+  <body>
+    <div id="app">
+      <div id="topbar">
+        <h1>OrthoPan</h1>
+        <label for="order">Order</label>
+        <select id="order"></select>
+        <button id="sortbtn" title="Sort orthogroups by presence contrast inside the selected clade">sort by contrast</button>
+        <span id="notice"></span>
+        <span id="legend" title="Presence fraction: left = absent, right = present"></span>
+        <span id="status">loading…</span>
+      </div>
+      <div id="body">
+        <div id="tree-col">
+          <div id="tree-spacer"></div>
+          <canvas id="tree"></canvas>
+        </div>
+        <div id="center">
+          <div id="tracks"><canvas id="tracks-canvas"></canvas></div>
+          <div id="matrix-wrap">
+            <div id="deck"></div>
+            <canvas id="overlay"></canvas>
+            <div id="tooltip"></div>
+          </div>
+        </div>
+        <div id="labels-col">
+          <div id="labels-spacer"></div>
+          <canvas id="labels"></canvas>
+        </div>
+        <div id="panel"></div>
+      </div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
