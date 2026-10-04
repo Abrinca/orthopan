@@ -5,8 +5,8 @@ import pytest
 DATA_DIR = Path(__file__).parent / "data"
 
 REMOTE_FILES = {
-    "N0.tsv": "https://opengenomebrowser.bioinformatics.unibe.ch/files_html/orthologs/N0.tsv",
-    "N0.descriptions.tsv": "https://opengenomebrowser.bioinformatics.unibe.ch/files_html/annotation-descriptions/OL.tsv",
+    "orthologs.tsv": "https://demo.abrinca.com/files_html/orthologs/orthologs.tsv?download",
+    "orthologs-descriptions.tsv": "https://demo.abrinca.com/files_html/orthologs/HOG_best_name.tsv?download",
 }
 
 

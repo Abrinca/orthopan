@@ -1,3 +1,7 @@
 resources
 scratch
 tests/data
+__pycache__
+*.pyc
+.venv
+.pytest*
