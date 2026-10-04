@@ -33,7 +33,8 @@ MAX_LIST = 5000
 MAX_BODY = 64 * 1024  # request-body cap for the POST endpoint
 _LRU_SIZE = 24
 _ROW_CHUNK = 512
-_DYNAMIC_PREFIX = "contrast:"  # order ids minted by POST /api/orders
+# order ids minted by POST /api/orders
+_DYNAMIC_PREFIX = ("contrast:", "search:", "pattern:")
 
 # Top-r-bit masks for masking a partial byte; MASKS[0] == 0.
 MASKS = np.array([((0xFF << (8 - r)) & 0xFF) for r in range(8)], np.uint8)
@@ -53,6 +54,11 @@ class Pangenome:
         if not manifest_path.is_file():
             raise FileNotFoundError(f"not an imported pangenome directory: {self.dir}")
         self.manifest = json.loads(manifest_path.read_text())
+        version = self.manifest.get("format_version", 1)
+        if version < 2:
+            raise ValueError(
+                f"dataset format {version} is outdated; re-run orthopan import"
+            )
 
         self.genomes = pl.read_parquet(self.dir / "genomes.parquet").sort("genome_idx")
         self.orthogroups = pl.read_parquet(self.dir / "orthogroups.parquet").sort("og_idx")
@@ -61,10 +67,17 @@ class Pangenome:
 
         self.genome_names = self.genomes["name"].to_list()
         self._name_to_idx = {name: i for i, name in enumerate(self.genome_names)}
+        self._og_to_idx = {
+            og: int(i) for og, i in zip(
+                self.orthogroups["orthogroup"].to_list(), self.orthogroups["og_idx"].to_list())
+        }
         row_order = self.genomes["row_order"].to_numpy()
         inv = np.empty(self.n_genomes, dtype=np.int64)
         inv[row_order] = np.arange(self.n_genomes, dtype=np.int64)
         self.row_order = row_order  # genome_idx -> tree row
+
+        self.pattern_ids = self.orthogroups["pattern_id"].to_numpy()
+        self.n_same_pattern = self.orthogroups["n_same_pattern"].to_numpy()
 
         presence = np.load(self.dir / "presence.npy")
         self.presence_tree = presence[inv]  # tree row order
@@ -88,6 +101,58 @@ class Pangenome:
         self._order_locks: dict[str, threading.Lock] = {}
         # ponytail: one lock guards the cache bookkeeping; per-order locks guard builds.
         self._lock = threading.Lock()
+
+        # --- v1 additions: annotations, genome metadata, multicopy ----------
+        self.annotation_specs = self.manifest.get("annotations", [])
+        self.annotation_names = [s["name"] for s in self.annotation_specs]
+        self._ann_kind = {s["name"]: s["kind"] for s in self.annotation_specs}
+        self._ann_categories = {
+            s["name"]: list(s.get("categories", [])) for s in self.annotation_specs
+        }
+        self.annotations = None
+        ann_path = self.dir / "annotations.parquet"
+        if self.annotation_names and ann_path.is_file():
+            self.annotations = pl.read_parquet(ann_path).sort("og_idx")
+        self._ann_codes: dict[str, np.ndarray] = {}
+        if self.annotations is not None:
+            for spec in self.annotation_specs:
+                if spec["kind"] != "categorical":
+                    continue
+                index = {c: i + 1 for i, c in enumerate(self._ann_categories[spec["name"]])}
+                column = self.annotations[spec["name"]].to_list()
+                self._ann_codes[spec["name"]] = np.array(
+                    [index.get(v, 0) if v is not None else 0 for v in column], np.uint16
+                )
+        # (column name, frame) pairs searched by /api/search.
+        self._search_fields = [("orthogroup", self.orthogroups)]
+        if self.annotations is not None:
+            for spec in self.annotation_specs:
+                self._search_fields.append((spec["name"], self.annotations))
+
+        self.gm_specs = self.manifest.get("genome_metadata", [])
+        self.gm_names = [s["name"] for s in self.gm_specs]
+        gm_path = self.dir / "genome_metadata.parquet"
+        self.genome_metadata = None
+        self._genome_meta = [dict() for _ in range(self.n_genomes)]
+        if self.gm_names and gm_path.is_file():
+            self.genome_metadata = pl.read_parquet(gm_path).sort("genome_idx")
+            for row in self.genome_metadata.iter_rows(named=True):
+                self._genome_meta[int(row["genome_idx"])] = {
+                    name: row[name] for name in self.gm_names
+                }
+
+        mc_path = self.dir / "multicopy.npz"
+        if mc_path.is_file():
+            with np.load(mc_path) as z:
+                self.mc_row = z["row"].astype(np.int64)
+                self.mc_og = z["og"].astype(np.int64)
+                self.mc_extra = z["extra"].astype(np.int64)
+        else:
+            self.mc_row = np.empty(0, np.int64)
+            self.mc_og = np.empty(0, np.int64)
+            self.mc_extra = np.empty(0, np.int64)
+
+        self.detail = self.manifest.get("detail", {}) or {}
 
         self.tree = self._build_tree()
         self._packed("tree")  # prewarm the default view
@@ -208,7 +273,8 @@ class Pangenome:
             return out
 
     # --- matrix -------------------------------------------------------------
-    def matrix(self, order, og0, og1, g0, g1, w, h) -> np.ndarray:
+    def matrix_counts(self, order, og0, og1, g0, g1, w, h) -> np.ndarray:
+        """Present-cell count per output bin, ``(h, w)`` int32."""
         packed = self._packed(order)
         col_abs = og0 + _edges(og1 - og0, w)
         row_local = _edges(g1 - g0, h)
@@ -222,12 +288,119 @@ class Pangenome:
         counts = np.bitwise_count(sub[:, b] & MASKS[r])  # (H, w+1)
         prefix = cs[:, b] + counts  # (H, w+1)
         colsum = prefix[:, 1:] - prefix[:, :-1]  # (H, w)
+        return np.add.reduceat(colsum, row_local[:-1], axis=0, dtype=np.int32)
 
-        rowsum = np.add.reduceat(colsum, row_local[:-1], axis=0, dtype=np.int32)  # (h, w)
-        row_sizes = np.diff(row_local)[:, None]
+    def matrix(self, order, og0, og1, g0, g1, w, h) -> np.ndarray:
+        rowsum = self.matrix_counts(order, og0, og1, g0, g1, w, h)
+        row_sizes = np.diff(_edges(g1 - g0, h))[:, None]
         col_sizes = np.diff(_edges(og1 - og0, w))[None, :]
         frac = rowsum / (row_sizes * col_sizes)
         return np.rint(frac * 255.0).clip(0, 255).astype("<u1")
+
+    def _inverse_perm(self, order) -> np.ndarray:
+        perm = self.order_perm(order)
+        inv = np.empty(self.n_og, np.int64)
+        inv[perm] = np.arange(self.n_og)
+        return inv
+
+    def matrix_copies(self, order, og0, og1, g0, g1, w, h) -> np.ndarray:
+        """Copy-number colour: 10*mean over present cells; 0 = no present cell."""
+        counts = self.matrix_counts(order, og0, og1, g0, g1, w, h)
+        if not counts.any():
+            return np.zeros((h, w), np.uint8)
+        extra = np.zeros((h, w), np.float64)
+        if self.mc_og.size:
+            inv = self._inverse_perm(order)
+            pos = inv[self.mc_og]
+            row = self.mc_row
+            sel = (pos >= og0) & (pos < og1) & (row >= g0) & (row < g1)
+            if sel.any():
+                cb = np.searchsorted(_edges(og1 - og0, w), pos[sel] - og0, side="right") - 1
+                rb = np.searchsorted(_edges(g1 - g0, h), row[sel] - g0, side="right") - 1
+                extra = np.bincount(
+                    rb * w + cb, weights=self.mc_extra[sel], minlength=h * w
+                ).reshape(h, w)
+        mean = np.divide(
+            counts + extra, counts, out=np.zeros((h, w), np.float64), where=counts > 0)
+        return np.rint(mean * 10.0).clip(0, 255).astype(np.uint8)
+
+    # --- annotation track ---------------------------------------------------
+    def annotation_track(self, order, og0, og1, w, name) -> np.ndarray:
+        """Most common category per bin, as ``1 + category index`` (0 = missing)."""
+        if name not in self._ann_codes:
+            raise HTTPException(
+                status_code=400, detail=f"not a categorical annotation: {name!r}"
+            )
+        perm = self.order_perm(order)
+        codes = self._ann_codes[name][perm[og0:og1]]
+        edges = _edges(og1 - og0, w)
+        n_cat = len(self._ann_categories[name])
+        out = np.zeros(w, np.uint16)
+        for i in range(w):
+            seg = codes[edges[i]:edges[i + 1]]
+            if seg.size:
+                counts = np.bincount(seg, minlength=n_cat + 1)[1:]
+                if counts.any():
+                    out[i] = int(np.argmax(counts)) + 1
+        return out
+
+    # --- search -------------------------------------------------------------
+    @staticmethod
+    def _field_mask(frame, name, q) -> np.ndarray:
+        """Case-insensitive literal substring mask for one column.
+
+        NB: this polars build (Python 3.15) silently returns ``None`` from
+        ``Series.str.*`` / ``fill_null`` / ``is_null`` / ``list.len`` because of
+        a broken bytecode check in polars' ``expr_dispatch``; only DataFrame
+        *expressions* work. Nulls are filled to ``False`` before the numpy
+        conversion, so an all-null annotation column masks to all-``False``.
+        """
+        return frame.select(
+            pl.col(name).str.to_lowercase().str.contains(q, literal=True).fill_null(False)
+        )[name].to_numpy()
+
+    def _hit_idxs(self, q) -> np.ndarray:
+        if not q:
+            return np.empty(0, np.int64)
+        q = q.lower()
+        hit = np.zeros(self.n_og, bool)
+        for name, frame in self._search_fields:
+            hit |= self._field_mask(frame, name, q)
+        return np.flatnonzero(hit)
+
+    def search(self, q, order, limit) -> dict:
+        inv = self._inverse_perm(order)
+        og_ids = self.orthogroups["orthogroup"].to_numpy()
+        hits = []
+        if q:
+            q = q.lower()
+            for name, frame in self._search_fields:
+                idxs = np.flatnonzero(self._field_mask(frame, name, q))
+                if idxs.size == 0:
+                    continue
+                values = (og_ids if name == "orthogroup"
+                          else frame[name].to_numpy())
+                for i in idxs:
+                    hits.append({
+                        "orthogroup": og_ids[i],
+                        "og_idx": int(i),
+                        "position": int(inv[i]),
+                        "field": name,
+                        "text": values[i],
+                    })
+        hits.sort(key=lambda h: h["position"])
+        return {"hits": hits[:limit], "total": len(hits)}
+
+    def search_perm(self, q) -> np.ndarray:
+        hit = np.zeros(self.n_og, bool)
+        hit[self._hit_idxs(q)] = True
+        mask = hit[self.perm_tree]
+        return np.concatenate([self.perm_tree[mask], self.perm_tree[~mask]]).astype(np.int64)
+
+    def pattern_perm(self, og_idx) -> np.ndarray:
+        mask = self.pattern_ids == self.pattern_ids[og_idx]
+        ordered = mask[self.perm_tree]
+        return np.concatenate([self.perm_tree[ordered], self.perm_tree[~ordered]]).astype(np.int64)
 
     # --- tracks -------------------------------------------------------------
     def track_means(self, order, og0, og1, w, names) -> np.ndarray:
@@ -283,6 +456,11 @@ class Pangenome:
             "tree_source": self.manifest.get("tree_source"),
             "orders": ["tree", "frequency"],
             "tracks": tracks,
+            "annotations": self.annotation_specs,
+            "genome_metadata": self.gm_specs,
+            "detail": {
+                key: bool(self.detail.get(key)) for key in ("msa", "gene_trees", "sequences")
+            },
         }
 
 
@@ -302,6 +480,15 @@ def _window(n_og, n_genomes, og0, og1, g0, g1, w, h):
     return og0, og1, g0, g1
 
 
+def _annotation_values(pg, og_idx: int) -> dict:
+    """``{annotation name: value}`` for one OG (row index == og_idx)."""
+    if pg.annotations is None:
+        return {}
+    row = pg.annotations.row(og_idx, named=True)
+    return {name: (None if row[name] is None else str(row[name]))
+            for name in pg.annotation_names}
+
+
 def create_app(data_dir, static_dir=None) -> FastAPI:
     pg = Pangenome(data_dir)
     app = FastAPI(title="OrthoPan", docs_url=None, redoc_url=None)
@@ -315,13 +502,15 @@ def create_app(data_dir, static_dir=None) -> FastAPI:
     def genomes():
         rows = []
         for row in pg.genomes.iter_rows(named=True):
+            genome_idx = int(row["genome_idx"])
             rows.append(
                 {
                     "row": int(row["row_order"]),
-                    "genome_idx": int(row["genome_idx"]),
+                    "genome_idx": genome_idx,
                     "name": row["name"],
                     "n_orthogroups": int(row["n_orthogroups"]),
                     "n_genes": int(row["n_genes"]),
+                    "metadata": pg._genome_meta[genome_idx],
                 }
             )
         rows.sort(key=lambda r: r["row"])
@@ -340,9 +529,15 @@ def create_app(data_dir, static_dir=None) -> FastAPI:
         g1: int | None = None,
         w: int = Query(...),
         h: int = Query(...),
+        value: str = "presence",
     ):
+        if value not in ("presence", "copies"):
+            raise HTTPException(status_code=400, detail=f"unknown value mode: {value!r}")
         og0, og1, g0, g1 = _window(pg.n_og, pg.n_genomes, og0, og1, g0, g1, w, h)
-        out = pg.matrix(order, og0, og1, g0, g1, w, h)
+        if value == "copies":
+            out = pg.matrix_copies(order, og0, og1, g0, g1, w, h)
+        else:
+            out = pg.matrix(order, og0, og1, g0, g1, w, h)
         return Response(
             content=out.tobytes(),
             media_type="application/octet-stream",
@@ -375,6 +570,37 @@ def create_app(data_dir, static_dir=None) -> FastAPI:
             headers={"X-Tracks": ",".join(selected)},
         )
 
+    @app.get("/api/annotation-track")
+    def annotation_track(
+        order: str = "tree",
+        og0: int = 0,
+        og1: int | None = None,
+        w: int = Query(...),
+        name: str = Query(...),
+    ):
+        og1 = pg.n_og if og1 is None else og1
+        if not (0 <= og0 < og1 <= pg.n_og):
+            raise HTTPException(status_code=400, detail="window out of range")
+        if not (1 <= w <= MAX_CELLS):
+            raise HTTPException(status_code=400, detail=f"w must be in 1..{MAX_CELLS}")
+        if w > og1 - og0:
+            raise HTTPException(status_code=400, detail="w exceeds window size")
+        out = pg.annotation_track(order, og0, og1, w, name)
+        return Response(
+            content=out.astype("<u2").tobytes(),
+            media_type="application/octet-stream",
+            headers={"X-Width": str(w), "X-Categories": name},
+        )
+
+    @app.get("/api/search")
+    def search(
+        q: str = Query(...),
+        order: str = "tree",
+        limit: int = 50,
+    ):
+        limit = max(1, min(limit, 500))
+        return pg.search(q, order, limit)
+
     @app.get("/api/orthogroups")
     def orthogroups(order: str = "tree", og0: int = 0, og1: int | None = None):
         og1 = pg.n_og if og1 is None else og1
@@ -397,21 +623,24 @@ def create_app(data_dir, static_dir=None) -> FastAPI:
         for name in pg.track_names:
             value = row[name]
             tracks[name] = None if value is None or np.isnan(value) else float(value)
+        annotations = _annotation_values(pg, og_idx)
         membership = pg.dir / "membership.parquet"
         members = []
         if membership.is_file():
             mem = (
                 pl.scan_parquet(membership)
-                .select(["og_idx", "genome_idx", "genes"])
+                .select(["og_idx", "genome_idx", "genes", "genes_raw"])
                 .filter(pl.col("og_idx") == og_idx)
                 .collect()
                 .sort("genome_idx")
             )
             for m in mem.iter_rows(named=True):
+                genes = list(m["genes"])
+                raw = list(m["genes_raw"])
                 members.append(
                     {
                         "genome": pg.genome_names[int(m["genome_idx"])],
-                        "genes": list(m["genes"]),
+                        "genes": [{"id": g, "raw": r} for g, r in zip(genes, raw)],
                     }
                 )
         return {
@@ -422,7 +651,34 @@ def create_app(data_dir, static_dir=None) -> FastAPI:
             "mrca_label": row["mrca_label"],
             "purity": None if row["purity"] is None else float(row["purity"]),
             "tracks": tracks,
+            "annotations": annotations,
+            "pattern_id": int(row["pattern_id"]),
+            "n_same_pattern": int(row["n_same_pattern"]),
             "members": members,
+        }
+
+    @app.get("/api/orthogroup/{og}/pattern")
+    def orthogroup_pattern(og: str, limit: int = 200):
+        og_idx = pg._og_to_idx.get(og)
+        if og_idx is None:
+            raise HTTPException(status_code=404, detail=f"unknown orthogroup: {og!r}")
+        limit = max(1, min(limit, MAX_LIST))
+        pid = int(pg.pattern_ids[og_idx])
+        og_ids = pg.orthogroups["orthogroup"].to_numpy()
+        pids = pg.pattern_ids
+        idxs = np.flatnonzero(pids == pid)[:limit]
+        orthogroups_out = [
+            {
+                "orthogroup": og_ids[i],
+                "og_idx": int(i),
+                "annotations": _annotation_values(pg, int(i)),
+            }
+            for i in idxs
+        ]
+        return {
+            "pattern_id": pid,
+            "total": int(pg.n_same_pattern[og_idx]),
+            "orthogroups": orthogroups_out,
         }
 
     @app.post("/api/orders")
@@ -439,19 +695,43 @@ def create_app(data_dir, static_dir=None) -> FastAPI:
             body = json.loads(raw)
         except (ValueError, UnicodeDecodeError):
             raise HTTPException(status_code=400, detail="invalid JSON body")
-        if not isinstance(body, dict) or body.get("by") != "contrast":
-            raise HTTPException(status_code=400, detail="only 'contrast' orders are supported")
-        names = body.get("genomes")
-        if not isinstance(names, list) or not names or not all(isinstance(n, str) for n in names):
-            raise HTTPException(status_code=400, detail="'genomes' must be a non-empty list of strings")
-        if len(names) > pg.n_genomes:
-            raise HTTPException(status_code=400, detail="more genomes than exist")
-        unique = list(dict.fromkeys(names))  # canonicalize duplicates, keep order
-        digest = hashlib.sha1(json.dumps(sorted(set(names))).encode()).hexdigest()[:12]
-        order_id = _DYNAMIC_PREFIX + digest
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="invalid JSON body")
+        by = body.get("by")
+        if by == "contrast":
+            names = body.get("genomes")
+            if not isinstance(names, list) or not names or not all(isinstance(n, str) for n in names):
+                raise HTTPException(
+                    status_code=400, detail="'genomes' must be a non-empty list of strings")
+            if len(names) > pg.n_genomes:
+                raise HTTPException(status_code=400, detail="more genomes than exist")
+            unique = list(dict.fromkeys(names))  # canonicalize duplicates, keep order
+            digest = hashlib.sha1(json.dumps(sorted(set(names))).encode()).hexdigest()[:12]
+            order_id = "contrast:" + digest
+        elif by == "search":
+            q = body.get("q")
+            if not isinstance(q, str) or not q:
+                raise HTTPException(status_code=400, detail="'q' must be a non-empty string")
+            digest = hashlib.sha1(json.dumps(q).encode()).hexdigest()[:12]
+            order_id = "search:" + digest
+        elif by == "pattern":
+            og = body.get("og")
+            if not isinstance(og, str):
+                raise HTTPException(status_code=400, detail="'og' must be a string")
+            if og not in pg._og_to_idx:
+                raise HTTPException(status_code=404, detail=f"unknown orthogroup: {og!r}")
+            digest = hashlib.sha1(og.encode()).hexdigest()[:12]
+            order_id = "pattern:" + digest
+        else:
+            raise HTTPException(status_code=400, detail="unknown order type")
         if pg._dynamic_get(order_id) is not None:
             return {"order": order_id}  # reuse the existing (possibly warm) entry
-        perm = pg.contrast_perm(unique)
+        if by == "contrast":
+            perm = pg.contrast_perm(unique)
+        elif by == "search":
+            perm = pg.search_perm(q)
+        else:
+            perm = pg.pattern_perm(pg._og_to_idx[og])
         with pg._lock:
             if order_id in pg._dynamic:
                 pg._dynamic.move_to_end(order_id)

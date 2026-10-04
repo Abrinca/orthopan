@@ -1,17 +1,20 @@
 """`orthopan import`: orthologs TSV (+ tree, tracks) -> processed pangenome dir.
 
-This is the first pipeline step (docs/design-decisions.md). It reads a Format B
-orthologs matrix with :func:`orthopan.io.read_matrix`, optionally validates it
-against a genome Newick tree (or builds a UPGMA tree with
-:func:`orthopan.tree.upgma_newick`), joins per-orthogroup track TSVs, and writes
-the files a future Deck.gl/DuckDB viewer queries:
+This is the first pipeline step (docs/design-decisions.md). It reads an orthologs
+matrix (Format A or B) with :func:`orthopan.io.read_matrix`, optionally validates
+it against a genome Newick tree (or builds a UPGMA tree with
+:func:`orthopan.tree.upgma_newick`), joins per-orthogroup track TSVs, annotations
+and genome metadata, and writes the files a future Deck.gl/DuckDB viewer queries:
 
-- ``genomes.parquet``      one row per genome, tree DFS row order
-- ``orthogroups.parquet``  one row per orthogroup, orderings + tracks
-- ``membership.parquet``   sparse present cells (og, genome, copies, genes)
-- ``presence.npy``         bit-packed presence, rows genome_idx, cols og_idx
-- ``tree.nwk``             the tree used, labels as given
-- ``manifest.json``        format version, inputs, counts, track columns
+- ``genomes.parquet``          one row per genome, tree DFS row order
+- ``orthogroups.parquet``      one row per orthogroup, orderings + tracks
+- ``membership.parquet``       sparse present cells (og, genome, copies, genes)
+- ``presence.npy``             bit-packed presence, rows genome_idx, cols og_idx
+- ``multicopy.npz``            sparse extra copies (tree row, og_idx, extra)
+- ``annotations.parquet``      per-orthogroup annotation columns (if any)
+- ``genome_metadata.parquet``  per-genome metadata columns (if any)
+- ``tree.nwk``                 the tree used, labels as given
+- ``manifest.json``            format version, inputs, counts, track columns
 """
 
 import argparse
@@ -24,18 +27,31 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 
-from orthopan.io import open_text, read_matrix, split_genes
+from orthopan.io import (
+    DEFAULT_GENE_PREFIX,
+    compile_prefix,
+    open_text,
+    read_matrix,
+    split_genes,
+    strip_gene_prefix,
+)
 from orthopan.tree import upgma_newick
 
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 DEFAULT_TRACKS = ("copy_number_mean", "copy_number_max")
 # Every column the importer writes to orthogroups.parquet; track columns may
 # not collide with any of them.
 _ORTHOGROUP_COLUMNS = frozenset({
     "og_idx", "orthogroup", "n_genomes", "n_genes",
     "mrca_node", "mrca_label", "purity", "order_tree", "order_frequency",
+    "pattern_id", "n_same_pattern",
     *DEFAULT_TRACKS,
 })
+# Columns the importer writes to genomes.parquet; metadata may not collide.
+_GENOME_COLUMNS = frozenset({
+    "genome_idx", "name", "row_order", "n_orthogroups", "n_genes",
+})
+_HEADER_IDS = ("orthogroup", "hog", "og")
 _MEMBERSHIP_BATCH = 10_000  # rows per membership Parquet part
 _MEMBERSHIP_ROW_GROUP = 10_000  # rows per row group in the final Parquet
 
@@ -241,35 +257,231 @@ class _Tree:
         return self.up[0][node]
 
 
-def _read_tracks(paths):
-    """Return (column names in file order, list of {og: tuple(values)})."""
-    columns, files, seen = [], [], set(_ORTHOGROUP_COLUMNS)
+# --- track / annotation / metadata readers ----------------------------------
+
+def _float_or_none(cell):
+    if cell == "":
+        return None
+    value = float(cell)
+    return value if math.isfinite(value) else None
+
+
+def _read_track_sources(paths):
+    """Return ``[(column names, {og: tuple(values)}), ...]`` in file order."""
+    sources = []
     for path in paths:
         with open_text(path) as fh:
             header = fh.readline().rstrip("\r\n").split("\t")
             names = header[1:]
-            for name in names:
-                if name in seen:
-                    raise ValueError(f"duplicate track column name: {name!r}")
-                seen.add(name)
-            columns.extend(names)
             values = {}
             for line in fh:
                 line = line.rstrip("\r\n")
                 if not line:
                     continue
                 cells = line.split("\t")
-                row = []
-                for cell in cells[1:1 + len(names)]:
-                    if cell == "":
-                        row.append(None)
-                        continue
-                    value = float(cell)
-                    row.append(value if math.isfinite(value) else None)
+                row = [_float_or_none(c) for c in cells[1:1 + len(names)]]
                 row += [None] * (len(names) - len(row))
                 values[cells[0]] = tuple(row)
-            files.append((names, values))
+            sources.append((names, values))
+    return sources
+
+
+def _dict_source(columns, rows):
+    """Convert ``{og: {track: value}}`` to a ``(names, {og: tuple})`` source."""
+    return columns, {og: tuple(r.get(c) for c in columns) for og, r in rows.items()}
+
+
+def _merge_sources(sources, reserved):
+    """Merge track sources, rejecting duplicate column names."""
+    columns, files, seen = [], [], set(reserved)
+    for names, values in sources:
+        for name in names:
+            if name in seen:
+                raise ValueError(f"duplicate track column name: {name!r}")
+            seen.add(name)
+        columns.extend(names)
+        files.append((names, values))
     return columns, files
+
+
+def _annotation_name(path):
+    name = Path(path).name
+    if name.lower().endswith(".gz"):
+        name = name[:-3]
+    stem = Path(name).stem
+    return "description" if "descriptions" in stem.lower() else stem
+
+
+def _read_annotation(path):
+    """Return ``(names, {name: {og: value}}, has_header)`` for one annotation file."""
+    with open_text(path) as fh:
+        first = None
+        for line in fh:
+            line = line.rstrip("\r\n")
+            if line:
+                first = line
+                break
+        if first is None:
+            raise ValueError(f"annotation file has no rows: {path}")
+        head = first.split("\t")
+        has_header = head[0].strip().lower() in _HEADER_IDS
+        names = [h.strip() for h in head[1:]] if has_header else [_annotation_name(path)]
+        if not names:
+            raise ValueError(f"annotation file has no columns: {path}")
+        data = {name: {} for name in names}
+        if not has_header:
+            data[names[0]][head[0]] = head[1] if len(head) > 1 else ""
+        for line in fh:
+            line = line.rstrip("\r\n")
+            if not line:
+                continue
+            cells = line.split("\t")
+            for i, name in enumerate(names):
+                value = cells[1 + i] if 1 + i < len(cells) else ""
+                data[name][cells[0]] = value
+    return names, data, has_header
+
+
+def _ordered_categories(counts):
+    return [c for c, _ in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))]
+
+
+def _annotation_specs(paths, recognized):
+    """Parse all ``--annotation`` files into specs and per-OG values.
+
+    Specs (kind, categories) are derived from ``recognized`` OG IDs only, so
+    unknown IDs in the file cannot shift the typing or the category frequencies.
+    """
+    specs, values = [], {}
+    seen = set(_ORTHOGROUP_COLUMNS)
+    for path in paths:
+        names, data, has_header = _read_annotation(path)
+        for name in names:
+            if not name:
+                raise ValueError(f"annotation column name is empty in {path}")
+            if name in seen:
+                raise ValueError(f"duplicate annotation column name: {name!r}")
+            seen.add(name)
+            column = data[name]
+            present = [v for og, v in column.items() if og in recognized and v != ""]
+            if not has_header:
+                kind = "text"
+            else:
+                kind = "categorical" if len(set(present)) <= 64 else "text"
+            spec = {"name": name, "kind": kind}
+            if kind == "categorical":
+                spec["categories"] = _ordered_categories(Counter(present))
+            specs.append(spec)
+            values[name] = column
+    return specs, values
+
+
+def _nonfinite(value):
+    """True if ``value`` parses as a float but is NaN/inf (treated as missing)."""
+    try:
+        return not math.isfinite(float(value))
+    except ValueError:
+        return False
+
+
+def _read_genome_metadata(path, recognized):
+    """Return ``(specs, {name: {genome: value}})`` for a genome metadata TSV.
+
+    Column names must be non-empty, unique and not built-in genomes columns.
+    NaN/inf cells are normalised to missing; specs use recognised genomes only.
+    """
+    with open_text(path) as fh:
+        first = None
+        for line in fh:
+            line = line.rstrip("\r\n")
+            if line:
+                first = line
+                break
+        if first is None:
+            raise ValueError(f"genome metadata file has no rows: {path}")
+        head = first.split("\t")
+        names = [h.strip() for h in head[1:]]
+        if not names:
+            raise ValueError(f"genome metadata file has no columns: {path}")
+        for name in names:
+            if not name:
+                raise ValueError(f"genome metadata column name is empty in {path}")
+        dupes = sorted({n for n in names if names.count(n) > 1})
+        if dupes:
+            raise ValueError(f"duplicate genome metadata column name(s): {dupes}")
+        clashes = sorted(set(names) & _GENOME_COLUMNS)
+        if clashes:
+            raise ValueError(
+                f"genome metadata column name(s) clash with built-in: {clashes}"
+            )
+        data = {name: {} for name in names}
+        for line in fh:
+            line = line.rstrip("\r\n")
+            if not line:
+                continue
+            cells = line.split("\t")
+            for i, name in enumerate(names):
+                value = cells[1 + i] if 1 + i < len(cells) else ""
+                if value and _nonfinite(value):
+                    value = ""  # NaN/inf -> missing
+                data[name][cells[0]] = value
+
+    specs = []
+    for name in names:
+        present = {g: v for g, v in data[name].items() if g in recognized and v != ""}
+        numeric = bool(present)
+        floats = []
+        for v in present.values():
+            try:
+                floats.append(float(v))
+            except ValueError:
+                numeric = False
+                break
+        if numeric:
+            specs.append({"name": name, "kind": "numeric",
+                          "min": min(floats), "max": max(floats)})
+        else:
+            specs.append({"name": name, "kind": "categorical",
+                          "categories": _ordered_categories(Counter(present.values()))})
+    return specs, data
+
+
+def _orthofinder_track_sources(results_dir):
+    """Run the track preprocessors for an OrthoFinder results dir, in-process."""
+    from orthopan.tracks.msa import TRACKS as MSA_TRACKS
+    from orthopan.tracks.msa import build_tracks as build_msa
+    from orthopan.tracks.orthofinder import COLUMNS as OF_COLUMNS
+    from orthopan.tracks.orthofinder import build_tracks as build_of
+
+    sources = [_dict_source(OF_COLUMNS, build_of(results_dir))]
+    msa_dir = results_dir / "MultipleSequenceAlignments"
+    if msa_dir.is_dir():
+        seqs = results_dir / "Orthogroup_Sequences"
+        rows = build_msa(
+            msa_dir,
+            seqs=seqs if seqs.is_dir() else None,
+            orthogroups=results_dir / "Orthogroups" / "Orthogroups.tsv",
+        )
+        sources.append(_dict_source(MSA_TRACKS, rows))
+    return sources
+
+
+def _orthofinder_tree_text(results_dir):
+    for name in ("SpeciesTree_rooted_node_labels.txt", "SpeciesTree_rooted.txt"):
+        path = results_dir / "Species_Tree" / name
+        if path.is_file():
+            return path.read_text()
+    raise ValueError(f"no species tree under {results_dir / 'Species_Tree'}")
+
+
+def _orthofinder_detail(results_dir):
+    detail = {}
+    for key, rel in (("msa", "MultipleSequenceAlignments"),
+                     ("gene_trees", "Resolved_Gene_Trees/Resolved_Gene_Trees.txt"),
+                     ("sequences", "Orthogroup_Sequences")):
+        path = results_dir / rel
+        detail[key] = str(path.resolve()) if path.exists() else None
+    return detail
 
 
 def _ranks(n, key):
@@ -280,8 +492,38 @@ def _ranks(n, key):
     return ranks
 
 
+def _pattern_ids(packed: np.ndarray, n_og: int) -> tuple[list[int], list[int]]:
+    """Group identical presence columns exactly; return (pattern_id, n_same)."""
+    if n_og == 0:
+        return [], []
+    dense = np.unpackbits(packed, axis=1, bitorder="big")[:, :n_og]
+    colbytes = np.packbits(dense, axis=0, bitorder="big")
+    groups, counts, ids, same = {}, {}, [], []
+    for j in range(n_og):
+        key = colbytes[:, j].tobytes()
+        pid = groups.get(key)
+        if pid is None:
+            pid = len(groups)
+            groups[key] = pid
+            counts[pid] = 1
+        else:
+            counts[pid] += 1
+        ids.append(pid)
+        same.append(counts[pid])
+    return ids, [counts[pid] for pid in ids]
+
+
 def run(args) -> None:
-    orthologs = Path(args.orthologs)
+    # --- resolve inputs -----------------------------------------------------
+    if args.orthofinder:
+        results_dir = Path(args.orthofinder)
+        orthologs = (Path(args.orthologs) if args.orthologs
+                     else results_dir / "Orthogroups" / "Orthogroups.tsv")
+    elif args.orthologs:
+        results_dir = None
+        orthologs = Path(args.orthologs)
+    else:
+        raise SystemExit("import: provide ORTHOLOGS or --orthofinder RESULTS_DIR")
     outdir = Path(args.out)
     outdir.mkdir(parents=True, exist_ok=True)
 
@@ -289,13 +531,17 @@ def run(args) -> None:
     if args.tree:
         tree_text = Path(args.tree).read_text()
         tree_source = "input"
+    elif results_dir is not None:
+        tree_text = _orthofinder_tree_text(results_dir)
+        tree_source = "orthofinder"
     else:
-        tree_text = upgma_newick(orthologs)
+        tree_text = upgma_newick(orthologs, strip_prefix=args.strip_prefix)
         tree_source = "upgma"
     tree = _Tree(_parse_newick(tree_text))
 
     # --- matrix labels + tree validation -----------------------------------
-    labels, rows = read_matrix(orthologs)
+    pattern = compile_prefix(args.strip_prefix)
+    labels, rows = read_matrix(orthologs, strip_prefix=args.strip_prefix)
     # `with rows` closes the matrix file even if validation or a row raises
     # before the iterator is exhausted.
     with rows:
@@ -318,8 +564,11 @@ def run(args) -> None:
         leaf_pre = {tree.label[i]: i for i in tree.leaf_order}
         genome_leafpos = [tree.leaf_pos[leaf_pre[name]] for name in labels]
 
-        # --- tracks ---------------------------------------------------------
-        track_columns, track_files = _read_tracks(args.track)
+        # --- tracks / annotations / metadata --------------------------------
+        sources = _read_track_sources(args.track)
+        if results_dir is not None:
+            sources.extend(_orthofinder_track_sources(results_dir))
+        track_columns, track_files = _merge_sources(sources, _ORTHOGROUP_COLUMNS)
         track_lookup = [(values, j) for names, values in track_files for j in range(len(names))]
 
         # --- stream rows ----------------------------------------------------
@@ -337,7 +586,8 @@ def run(args) -> None:
 
         presence = [bytearray() for _ in range(n_genomes)]
         presence_len = 0
-        mem_og, mem_genome, mem_copies, mem_genes = [], [], [], []
+        mem_og, mem_genome, mem_copies, mem_genes, mem_genes_raw = [], [], [], [], []
+        mc_row, mc_og, mc_extra = [], [], []
         parts = []
 
         def flush_membership():
@@ -346,8 +596,12 @@ def run(args) -> None:
             lengths = np.fromiter((len(genes) for genes in mem_genes), np.int64)
             rows = np.repeat(np.arange(len(mem_og), dtype=np.int64), lengths)
             flat = pl.DataFrame(
-                {"row": rows, "genes": pl.Series("genes", [g for genes in mem_genes for g in genes], pl.Utf8)}
-            ).group_by("row", maintain_order=True).agg(pl.col("genes"))
+                {
+                    "row": rows,
+                    "genes": pl.Series("genes", [g for genes in mem_genes for g in genes], pl.Utf8),
+                    "genes_raw": pl.Series("genes_raw", [g for genes in mem_genes_raw for g in genes], pl.Utf8),
+                }
+            ).group_by("row", maintain_order=True).agg(pl.col("genes"), pl.col("genes_raw"))
             frame = (
                 pl.DataFrame(
                     {
@@ -364,7 +618,7 @@ def run(args) -> None:
             part = outdir / f"_membership.{len(parts)}.parquet"
             frame.write_parquet(part)
             parts.append(part)
-            del mem_og[:], mem_genome[:], mem_copies[:], mem_genes[:]
+            del mem_og[:], mem_genome[:], mem_copies[:], mem_genes[:], mem_genes_raw[:]
 
         for og, cells in rows:
             og_idx = len(og_ids)
@@ -385,10 +639,11 @@ def run(args) -> None:
             for genome_idx, cell in enumerate(cells):
                 if not cell:
                     continue
-                genes = tuple(split_genes(cell))
-                if not genes:
+                raw_genes = tuple(split_genes(cell))
+                if not raw_genes:
                     continue
-                copies = len(genes)
+                genes = tuple(strip_gene_prefix(g, pattern) for g in raw_genes)
+                copies = len(raw_genes)
                 present += 1
                 total += copies
                 if copies > max_copies:
@@ -405,6 +660,11 @@ def run(args) -> None:
                 mem_genome.append(genome_idx)
                 mem_copies.append(copies)
                 mem_genes.append(genes)
+                mem_genes_raw.append(raw_genes)
+                if copies > 1:
+                    mc_row.append(pos)
+                    mc_og.append(og_idx)
+                    mc_extra.append(copies - 1)
 
             og_n_genomes.append(present)
             og_n_genes.append(total)
@@ -430,6 +690,12 @@ def run(args) -> None:
         flush_membership()
         n_og = len(og_ids)
 
+        # Specs come from recognised IDs only; unknown IDs still warn below.
+        annotation_specs, annotation_values = _annotation_specs(args.annotation, matrix_ogs)
+        gm_specs, gm_values = ({}, {})
+        if args.genome_metadata:
+            gm_specs, gm_values = _read_genome_metadata(args.genome_metadata, set(labels))
+
     # --- unknown track OGs warning -----------------------------------------
     if track_files:
         track_ogs = set()
@@ -441,6 +707,29 @@ def run(args) -> None:
                 f"warning: {len(unknown)} track orthogroup(s) not in the matrix (ignored)",
                 file=sys.stderr,
             )
+
+    # --- unknown annotation OGs warning ------------------------------------
+    for spec in annotation_specs:
+        column = annotation_values[spec["name"]]
+        unknown = set(column) - matrix_ogs
+        if unknown:
+            print(
+                f"warning: annotation {spec['name']!r}: {len(unknown)} orthogroup(s) "
+                "not in the matrix (ignored/counted)",
+                file=sys.stderr,
+            )
+
+    # --- unknown genome metadata warning -----------------------------------
+    if args.genome_metadata:
+        known = set(labels)
+        for spec in gm_specs:
+            unknown = set(gm_values[spec["name"]]) - known
+            if unknown:
+                print(
+                    f"warning: genome metadata {spec['name']!r}: {len(unknown)} genome(s) "
+                    "not in the matrix (ignored)",
+                    file=sys.stderr,
+                )
 
     # --- orderings ----------------------------------------------------------
     order_tree = _ranks(
@@ -455,8 +744,18 @@ def run(args) -> None:
 
     nbytes = (n_og + 7) // 8
     raw = b"".join(bytes(buf[:nbytes]) for buf in presence)
-    np.save(outdir / "presence.npy", np.frombuffer(raw, np.uint8).reshape(n_genomes, nbytes))
-    del presence, raw  # release the bit buffers now that presence.npy exists
+    packed = np.frombuffer(raw, np.uint8).reshape(n_genomes, nbytes)
+    np.save(outdir / "presence.npy", packed)
+    del presence
+    pattern_id, n_same_pattern = _pattern_ids(packed, n_og)
+    del raw
+
+    np.savez_compressed(
+        outdir / "multicopy.npz",
+        row=np.asarray(mc_row, np.uint32),
+        og=np.asarray(mc_og, np.uint32),
+        extra=np.asarray(mc_extra, np.uint32),
+    )
 
     orthogroups_schema = {
         "og_idx": pl.UInt32,
@@ -470,6 +769,8 @@ def run(args) -> None:
         "purity": pl.Float64,
         "order_tree": pl.UInt32,
         "order_frequency": pl.UInt32,
+        "pattern_id": pl.UInt32,
+        "n_same_pattern": pl.UInt32,
     }
     for name in track_columns:
         orthogroups_schema[name] = pl.Float64
@@ -485,6 +786,8 @@ def run(args) -> None:
         "purity": og_purity,
         "order_tree": order_tree,
         "order_frequency": order_frequency,
+        "pattern_id": pattern_id,
+        "n_same_pattern": n_same_pattern,
     }
     for name, values in zip(track_columns, track_values):
         orthogroups_data[name] = values
@@ -509,11 +812,46 @@ def run(args) -> None:
         },
     ).write_parquet(outdir / "genomes.parquet")
 
+    # annotations.parquet: og_idx + one column per annotation
+    ann_path = outdir / "annotations.parquet"
+    if annotation_specs:
+        ann_data = {"og_idx": pl.Series("og_idx", np.arange(n_og), dtype=pl.UInt32)}
+        ann_schema = {"og_idx": pl.UInt32}
+        for spec in annotation_specs:
+            column = annotation_values[spec["name"]]
+            ann_data[spec["name"]] = [column.get(og) or None for og in og_ids]
+            # Explicit Utf8: an all-null column must not be inferred as Null
+            # (that breaks the server's search expressions).
+            ann_schema[spec["name"]] = pl.Utf8
+        pl.DataFrame(ann_data, schema=ann_schema).write_parquet(ann_path)
+    elif ann_path.exists():
+        ann_path.unlink()
+
+    # genome_metadata.parquet: genome_idx + one column per metadata field
+    gm_path = outdir / "genome_metadata.parquet"
+    if gm_specs:
+        gm_data = {"genome_idx": pl.Series("genome_idx", np.arange(n_genomes), dtype=pl.UInt32)}
+        gm_schema = {"genome_idx": pl.UInt32}
+        for spec in gm_specs:
+            column = gm_values[spec["name"]]
+            if spec["kind"] == "numeric":
+                gm_data[spec["name"]] = [
+                    float(column[l]) if column.get(l, "") != "" else None for l in labels
+                ]
+                gm_schema[spec["name"]] = pl.Float64
+            else:
+                gm_data[spec["name"]] = [column.get(l) or None for l in labels]
+                gm_schema[spec["name"]] = pl.Utf8
+        pl.DataFrame(gm_data, schema=gm_schema).write_parquet(gm_path)
+    elif gm_path.exists():
+        gm_path.unlink()
+
     membership_schema = {
         "og_idx": pl.UInt32,
         "genome_idx": pl.UInt32,
         "copies": pl.UInt32,
         "genes": pl.List(pl.Utf8),
+        "genes_raw": pl.List(pl.Utf8),
     }
     membership = outdir / "membership.parquet"
     if len(parts) == 1:
@@ -530,10 +868,14 @@ def run(args) -> None:
     manifest = {
         "format_version": FORMAT_VERSION,
         "orthologs": str(orthologs),
+        "orthofinder": str(results_dir) if results_dir is not None else None,
         "tree": str(args.tree) if args.tree else None,
         "tree_source": tree_source,
         "tracks": [str(t) for t in args.track],
         "track_columns": track_columns,
+        "annotations": annotation_specs,
+        "genome_metadata": gm_specs,
+        "detail": _orthofinder_detail(results_dir) if results_dir is not None else {},
         "n_genomes": n_genomes,
         "n_orthogroups": n_og,
         "n_membership": sum(og_n_genomes),
@@ -544,11 +886,20 @@ def run(args) -> None:
 
 def add_parser(subparsers):
     p = subparsers.add_parser("import", help="build a processed pangenome directory")
-    p.add_argument("orthologs", help="orthologs TSV/TSV.GZ in per-genome matrix format")
+    p.add_argument("orthologs", nargs="?",
+                   help="orthologs TSV/TSV.GZ (Format A or B); optional with --orthofinder")
     p.add_argument("-o", "--out", required=True, metavar="OUTDIR", help="output directory")
-    p.add_argument("--tree", metavar="NEWICK", help="genome tree; default: UPGMA on Jaccard")
+    p.add_argument("--tree", metavar="NEWICK", help="genome tree; default: UPGMA or OrthoFinder")
+    p.add_argument("--orthofinder", metavar="RESULTS_DIR",
+                   help="OrthoFinder results dir: infer inputs and run track preprocessors")
     p.add_argument("--track", action="append", default=[], metavar="TSV",
                    help="per-orthogroup track TSV (repeatable)")
+    p.add_argument("--annotation", action="append", default=[], metavar="FILE",
+                   help="per-orthogroup annotation file (repeatable)")
+    p.add_argument("--genome-metadata", metavar="TSV",
+                   help="per-genome metadata TSV (header; first column genome name)")
+    p.add_argument("--strip-prefix", default=DEFAULT_GENE_PREFIX, metavar="REGEX",
+                   help="gene-ID prefix to strip (default: ^gnl\\|[^|]+\\|; empty disables)")
     p.set_defaults(func=run)
 
 

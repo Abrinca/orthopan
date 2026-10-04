@@ -83,3 +83,49 @@ Reference dataset: 2,193 × 50,515. Long-term target: 10k genomes.
 - The default `tree` order is packed at startup. Dynamic orders (`POST /api/orders`) are
   packed lazily on first use, which costs a few hundred milliseconds on the reference
   dataset; later requests with the same order id are fast.
+
+## v1 additions: annotations, genome metadata, search, copy number
+
+These additions are backwards compatible. Existing endpoints keep their behaviour unless a change is noted here.
+
+### `GET /api/meta` (extended)
+New fields:
+```json
+{"annotations": [{"name": "description", "kind": "text"},
+                 {"name": "cog_category", "kind": "categorical", "categories": ["J", "K", "L"]}],
+ "genome_metadata": [{"name": "clade", "kind": "categorical", "categories": ["A", "B"]},
+                     {"name": "gc", "kind": "numeric", "min": 0.35, "max": 0.41}],
+ "detail": {"msa": true, "gene_trees": true, "sequences": true}}
+```
+- A text column is free text: tooltip, panel and search only.
+- A categorical column is a string column with at most 64 distinct values. `categories` lists them by frequency, most common first.
+
+### `GET /api/genomes` (extended)
+Each entry gains `"metadata": {"clade": "A", "gc": 0.38}`. A missing value is `null`.
+
+### `GET /api/matrix` (extended): `value=presence|copies`
+- `presence` (default) is unchanged.
+- `copies` returns a `Uint8` per bin: 0 if the bin has no present cell, otherwise `min(255, round(10 * mean copy number over present cells))`. So 10 means 1.0 copies and 25 means 2.5.
+
+### `GET /api/annotation-track?order=&og0=&og1=&w=&name=`
+- For a categorical annotation, returns a `Uint16Array` of `w` values.
+- Each value is `1 + index` into `categories` for the most common category in the bin. 0 means missing.
+- Ties go to the lower index.
+- A text annotation returns 400.
+
+### `GET /api/search?q=&order=&limit=50`
+- Case-insensitive substring search over orthogroup IDs and all text and categorical annotations.
+- Returns `[{"orthogroup", "og_idx", "position", "field", "text"}]`, where `position` is the OG's position in `order`.
+- Results are sorted by position. `limit` is capped at 500. The response also gives the total hit count, as `{"hits": [...], "total": N}`.
+
+### `POST /api/orders` (extended)
+`{"by": "search", "q": "transporter"}` returns an order with the hits first, keeping their relative order from `tree`, followed by the rest in `tree` order. The same id rules and LRU apply as for contrast orders.
+
+### `GET /api/orthogroup/{og}` (extended)
+- Adds `"annotations": {"description": "..."}`, `"pattern_id": 123` and `"n_same_pattern": 4`.
+- Each member gene is `{"id": "FAM1_000123", "raw": "gnl|extdb|FAM1_000123"}`. `id` is the display ID with the prefix stripped. `raw` is the ID as in the input, used to match OrthoFinder files.
+- Note: `members[].genes` changes from a list of strings to a list of these objects.
+
+### `GET /api/orthogroup/{og}/pattern?limit=200`
+- Returns the OGs whose presence/absence pattern is identical to this one: `{"pattern_id", "total", "orthogroups": [{"orthogroup", "og_idx", "annotations"}]}`.
+- `POST /api/orders {"by": "pattern", "og": "OG0000123"}` returns an order with the pattern group first.

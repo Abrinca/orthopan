@@ -298,7 +298,7 @@ def test_orthogroup_detail_members(client):
     assert body["n_genomes"] == 1
     assert body["n_genes"] == 1
     assert body["tracks"]["score"] == 5.0
-    assert body["members"] == [{"genome": "A", "genes": ["x"]}]
+    assert body["members"] == [{"genome": "A", "genes": [{"id": "x", "raw": "x"}]}]
 
     empty = client.get("/api/orthogroup/OG_empty").json()
     assert empty["n_genomes"] == 0

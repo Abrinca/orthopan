@@ -2,7 +2,7 @@ import gzip
 
 import pytest
 
-from orthopan.io import read_matrix
+from orthopan.io import read_matrix, split_genes
 
 
 def _write(tmp_path, name, data):
@@ -83,4 +83,66 @@ def test_with_closes_file_when_body_raises(tmp_path):
         with rows:
             assert not rows._fh.closed
             raise RuntimeError("boom")
+    assert rows._fh.closed
+
+
+# --- Format A: flat two-column (genome from gene ID) ------------------------
+
+FORMAT_A = (
+    "N0.HOG0000000\tgnl|extdb|FAM1-i1-1.1_001153, gnl|extdb|FAM2-i1-1.1_001100\n"
+    "N0.HOG0000001\tgnl|extdb|FAM1-i1-1.1_001457, gnl|extdb|FAM1-i1-1.1_001458\n"
+    "N0.HOG0000002\t\n"
+)
+
+
+def _read_a(path, **kw):
+    labels, rows = read_matrix(path, **kw)
+    return labels, list(rows)
+
+
+def test_format_a_genome_from_gene(tmp_path):
+    labels, rows = _read_a(_write(tmp_path, "a.tsv", FORMAT_A))
+    assert labels == ["FAM1-i1-1.1", "FAM2-i1-1.1"]
+    assert rows[0] == (
+        "N0.HOG0000000",
+        ["gnl|extdb|FAM1-i1-1.1_001153", "gnl|extdb|FAM2-i1-1.1_001100"],
+    )
+    # both genes of row 2 come from the same genome, joined back into one cell
+    assert rows[1] == (
+        "N0.HOG0000001",
+        ["gnl|extdb|FAM1-i1-1.1_001457, gnl|extdb|FAM1-i1-1.1_001458", ""],
+    )
+    assert rows[2] == ("N0.HOG0000002", ["", ""])
+
+
+def test_format_a_gz(tmp_path):
+    raw = gzip.compress(FORMAT_A.encode())
+    labels, rows = _read_a(_write(tmp_path, "a.bin", raw))
+    assert labels == ["FAM1-i1-1.1", "FAM2-i1-1.1"]
+    assert split_genes(rows[1][1][0]) == [
+        "gnl|extdb|FAM1-i1-1.1_001457", "gnl|extdb|FAM1-i1-1.1_001458"]
+
+
+def test_format_a_prefix_disabled(tmp_path):
+    labels, rows = _read_a(_write(tmp_path, "a.tsv", FORMAT_A), strip_prefix="")
+    assert labels == ["gnl|extdb|FAM1-i1-1.1", "gnl|extdb|FAM2-i1-1.1"]
+
+
+def test_format_a_no_underscore_gene(tmp_path):
+    text = "HOG1\tgnl|extdb|genomeX, gnl|extdb|genomeY_1\n"
+    labels, rows = _read_a(_write(tmp_path, "a.tsv", text))
+    assert labels == ["genomeX", "genomeY"]
+    assert rows[0][1] == ["gnl|extdb|genomeX", "gnl|extdb|genomeY_1"]
+
+
+def test_format_a_two_column_with_header_is_matrix(tmp_path):
+    # A header makes it Format B even with one genome column.
+    _, rows = _read_a(_write(tmp_path, "h.tsv", "Orthogroup\tA\nOG1\tgene\n"))
+    assert rows == [("OG1", ["gene"])]
+
+
+def test_format_a_close_semantics(tmp_path):
+    _, rows = read_matrix(_write(tmp_path, "a.tsv", FORMAT_A))
+    assert not rows._fh.closed
+    rows.close()
     assert rows._fh.closed

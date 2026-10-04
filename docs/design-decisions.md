@@ -36,6 +36,20 @@ Decisions taken so far (2026-10-04). See `VISION.md` for context and `docs/anvio
 - The API contract is in `docs/api.md`.
 - The first build step is `orthopan import`: TSV plus optional tree in, Parquet directory with orderings out.
 
+## Annotations, metadata and detail data (v1)
+
+- `--annotation FILE` can be repeated.
+  - A 2-column file without a header is a free-text column named after the file stem (`description` if the stem is `*descriptions*`).
+  - A file with a header (first column = orthogroup ID) gives named columns. A string column with at most 64 distinct values is categorical; otherwise it is text.
+  - Text and categorical annotations appear in the tooltip and panel, and are searchable. Categorical annotations are also drawn as a colour strip.
+- `--genome-metadata TSV` has a header, and its first column is the genome name. Each field is drawn as a narrow coloured column between the tree and the heatmap, using a categorical palette or a numeric gradient.
+- Gene ID prefixes (default regex `^gnl\|[^|]+\|`, configurable) are stripped at import for display. The raw ID is kept, because it's needed to match OrthoFinder MSA and FASTA headers.
+- `--orthofinder RESULTS_DIR` auto-detects `Orthogroups.tsv` and the species tree, runs the track preprocessors, and records the MSA, gene-tree and sequence paths in the manifest. The server reads those files on demand for the single-orthogroup view.
+- Format A (2-column orthogroup → genes, with the genome taken from the gene-ID prefix) is supported, so `tests/data` can be used.
+- Each orthogroup gets a `pattern_id` (identical presence/absence rows share one) for "same pattern" queries.
+- Copy-number colour mode: a zoomed-out bin shows the mean copy number over its present cells. Absent cells stay white.
+- Order of work: annotations, metadata, search and copy number first; then the single-orthogroup view (MSA viewer, gene tree, members table).
+
 ## Per-orthogroup tracks
 
 - Tracks are the extension point. A track file is a TSV with the header `orthogroup<TAB><track>[<TAB><track>...]`, float values, and an empty cell for missing values. Users can supply their own track files as custom tracks.

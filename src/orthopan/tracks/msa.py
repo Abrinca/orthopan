@@ -317,31 +317,24 @@ def _members_from_cells(labels, cells):
     return {labels[i]: split_genes(cell) for i, cell in enumerate(cells) if cell}
 
 
-def main(argv=None):
-    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("msa_dir", help="MultipleSequenceAlignments directory")
-    p.add_argument("--seqs", help="Orthogroup_Sequences directory (for the trimmed flag)")
-    p.add_argument("-o", "--out", help="output track TSV (default: stdout)")
-    p.add_argument("--threads", type=int, default=os.cpu_count() or 1)
-    p.add_argument("--weighting", choices=["genome", "pooled"], default="genome")
-    p.add_argument("--orthogroups", help="Orthogroups.tsv (genome mapping for --weighting genome)")
-    args = p.parse_args(argv)
-
-    msa_dir = Path(args.msa_dir)
+def build_tracks(msa_dir, seqs=None, orthogroups=None, threads=None, weighting="genome"):
+    """Compute the MSA tracks for every orthogroup; return ``{og: {track: value}}``."""
+    msa_dir = Path(msa_dir)
     if not msa_dir.is_dir():
-        p.error(f"{msa_dir} is not a directory")
+        raise ValueError(f"{msa_dir} is not a directory")
+    if threads is None:
+        threads = os.cpu_count() or 1
     msa_ogs = {f.stem for f in msa_dir.glob("*.fa")}
 
-    weighting = args.weighting
-    if weighting == "genome" and not args.orthogroups:
+    if weighting == "genome" and not orthogroups:
         print("warning: no genome mapping (--orthogroups not given); falling back to pooled", file=sys.stderr)
         weighting = "pooled"
     # Membership is only needed to weight genomes or to exactly match headers for trimmed.
-    need_members = weighting == "genome" or args.seqs is not None
+    need_members = weighting == "genome" or seqs is not None
 
     cfg = {
         "msa_dir": str(msa_dir),
-        "seqs_dir": str(args.seqs) if args.seqs else None,
+        "seqs_dir": str(seqs) if seqs else None,
         "weighting": weighting,
     }
 
@@ -349,14 +342,14 @@ def main(argv=None):
     results = {}
     n_fallback = 0
 
-    if args.threads and args.threads > 1 and (msa_ogs or args.orthogroups):
+    if threads and threads > 1 and (msa_ogs or orthogroups):
         # Platform default start method (forkserver/spawn): fork after native threads
         # can deadlock. _init passes config explicitly; batches bound in-flight memory.
         with ProcessPoolExecutor(
-            max_workers=args.threads, initializer=_init, initargs=(cfg,)
+            max_workers=threads, initializer=_init, initargs=(cfg,)
         ) as ex:
             pending, processed, batch = [], set(), []
-            limit, chunk = 2 * args.threads, 32
+            limit, chunk = 2 * threads, 32
 
             def record(item):
                 nonlocal n_fallback
@@ -376,8 +369,8 @@ def main(argv=None):
                             record(item)
                     pending[:] = list(still)
 
-            if args.orthogroups:
-                labels, rows = read_matrix(args.orthogroups)
+            if orthogroups:
+                labels, rows = read_matrix(orthogroups)
                 for og, cells in rows:
                     processed.add(og)
                     batch.append((og, _members_from_cells(labels, cells) if need_members else {}))
@@ -395,8 +388,8 @@ def main(argv=None):
     else:
         _init(cfg)
         processed = set()
-        if args.orthogroups:
-            labels, rows = read_matrix(args.orthogroups)
+        if orthogroups:
+            labels, rows = read_matrix(orthogroups)
             for og, cells in rows:
                 processed.add(og)
                 members = _members_from_cells(labels, cells) if need_members else {}
@@ -413,14 +406,29 @@ def main(argv=None):
             file=sys.stderr,
         )
 
-    write_tracks({og: results[og] for og in sorted(results)}, TRACKS, args.out)
     elapsed = time.time() - t0
     n_msa = len(msa_ogs)
     print(
         f"{len(results)} orthogroups ({n_msa} with MSAs) in {elapsed:.2f}s "
-        f"({n_msa / elapsed:.0f} MSAs/s, {args.threads} threads)",
+        f"({n_msa / elapsed:.0f} MSAs/s, {threads} threads)",
         file=sys.stderr,
     )
+    return results
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument("msa_dir", help="MultipleSequenceAlignments directory")
+    p.add_argument("--seqs", help="Orthogroup_Sequences directory (for the trimmed flag)")
+    p.add_argument("-o", "--out", help="output track TSV (default: stdout)")
+    p.add_argument("--threads", type=int, default=os.cpu_count() or 1)
+    p.add_argument("--weighting", choices=["genome", "pooled"], default="genome")
+    p.add_argument("--orthogroups", help="Orthogroups.tsv (genome mapping for --weighting genome)")
+    args = p.parse_args(argv)
+    if not Path(args.msa_dir).is_dir():
+        p.error(f"{args.msa_dir} is not a directory")
+    results = build_tracks(args.msa_dir, args.seqs, args.orthogroups, args.threads, args.weighting)
+    write_tracks({og: results[og] for og in sorted(results)}, TRACKS, args.out)
     return 0
 
 

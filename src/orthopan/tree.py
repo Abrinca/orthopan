@@ -8,11 +8,32 @@ import numpy as np
 from scipy.cluster.hierarchy import linkage, to_tree
 from scipy.spatial.distance import squareform
 
+from orthopan.io import DEFAULT_GENE_PREFIX, open_text, read_matrix
+
 _SPECIAL = set("(),:;'[]")
 
 
-def _matrix(path):
+def _is_format_a(path):
+    """Headerless two-column input -> Format A (genome from the gene ID)."""
+    with open_text(path) as fh:
+        for line in fh:
+            line = line.rstrip("\r\n")
+            if not line:
+                continue
+            head = line.split("\t")
+            return head[0] not in ("Orthogroup", "HOG") and len(head) == 2
+    return False
+
+
+def _matrix(path, strip_prefix=DEFAULT_GENE_PREFIX):
     """Return (genome labels, presence matrix with genomes as rows)."""
+    if _is_format_a(path):
+        labels, rows = read_matrix(path, strip_prefix=strip_prefix)
+        n = len(labels)
+        arr = np.array([[bool(c) for c in cells] for _, cells in rows], bool)
+        if arr.size == 0:
+            return labels, np.zeros((n, 0), bool)
+        return labels, arr.T
     with open(path, "rb") as fh:
         magic = fh.read(2) == b"\x1f\x8b"
     labels, n, buf = [], None, bytearray()
@@ -76,9 +97,9 @@ def _newick(root, labels):
     return "".join(out)
 
 
-def upgma_newick(path) -> str:
+def upgma_newick(path, strip_prefix=DEFAULT_GENE_PREFIX) -> str:
     """Return Newick with UPGMA (average linkage) on Jaccard distances."""
-    labels, matrix = _matrix(path)
+    labels, matrix = _matrix(path, strip_prefix)
     if len(labels) < 2:
         return _quote(labels[0]) + ";"
     root = to_tree(linkage(_jaccard(matrix), method="average"))
