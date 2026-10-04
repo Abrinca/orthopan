@@ -3,6 +3,7 @@
 
 import {Deck, OrthographicView} from '@deck.gl/core';
 import {BitmapLayer} from '@deck.gl/layers';
+import {copiesBucket} from './decode';
 import type {View} from './transform';
 
 // Sparse windows produce tiny non-zero fractions; a gamma lift keeps them
@@ -64,6 +65,49 @@ export function toImageData(values: Uint8Array, w: number, h: number): ImageData
   return new ImageData(rgba, w, h);
 }
 
+// --- copy-number discrete colormap -----------------------------------------
+
+// bucket 0 (absent) is white; 1..5 are "1, 2, 3, 4, 5+" copies
+const COPIES_COLORS: [number, number, number][] = [
+  [255, 255, 255],
+  [254, 227, 145],
+  [254, 196, 79],
+  [254, 153, 41],
+  [217, 95, 14],
+  [153, 52, 4],
+];
+
+export function copiesLegend(): {level: number; label: string; color: string}[] {
+  return COPIES_COLORS.map((c, i) => ({
+    level: i,
+    label: i === 0 ? 'absent' : i === 5 ? '5+' : String(i),
+    color: `rgb(${c[0]},${c[1]},${c[2]})`,
+  }));
+}
+
+/** Expand copy-number bin bytes (raw = round(10*mean)) into an RGBA image. */
+export function toCopiesImageData(values: Uint8Array, w: number, h: number): ImageData {
+  const rgba = new Uint8ClampedArray(w * h * 4);
+  const n = Math.min(values.length, w * h);
+  for (let i = 0, j = 0; i < n; i++, j += 4) {
+    const c = COPIES_COLORS[copiesBucket(values[i])];
+    rgba[j] = c[0];
+    rgba[j + 1] = c[1];
+    rgba[j + 2] = c[2];
+    rgba[j + 3] = 255;
+  }
+  return new ImageData(rgba, w, h);
+}
+
+export function toImageDataFor(
+  mode: 'presence' | 'copies',
+  values: Uint8Array,
+  w: number,
+  h: number,
+): ImageData {
+  return mode === 'copies' ? toCopiesImageData(values, w, h) : toImageData(values, w, h);
+}
+
 // --- deck.gl heatmap --------------------------------------------------------
 
 export class Heatmap {
@@ -98,6 +142,12 @@ export class Heatmap {
 
   setView(v: View): void {
     this.deck.setProps({viewState: viewStateOf(v)});
+  }
+
+  /** Force the WebGL canvas to re-read devicePixelRatio after a DPR-only change. */
+  resyncDpr(): void {
+    this.deck.setProps({useDevicePixels: window.devicePixelRatio || 1});
+    this.deck.redraw('dpr-change');
   }
 
   setData(image: ImageData, bounds: [number, number, number, number]): void {

@@ -253,6 +253,62 @@ function resolveOrder(order: string): number[] | null {
   return null;
 }
 
+// --- v1: annotations, genome metadata and presence patterns ----------------
+
+const COG_NAMES = ['J', 'K', 'L', 'D', 'O', 'M', 'G', 'E', 'F', 'H'];
+const ogDescription: string[] = new Array(N_OG);
+const ogCog: string[] = new Array(N_OG);
+const cogCount = new Map<string, number>();
+const DESC_WORDS = ['transporter', 'kinase', 'synthase', 'regulator', 'hydrolase', 'binding', 'ribosomal', 'oxidase', 'reductase', 'permease'];
+for (let og = 0; og < N_OG; og++) {
+  ogDescription[og] = `${DESC_WORDS[og % DESC_WORDS.length]} family OG${String(og).padStart(7, '0')}`;
+  const cog = COG_NAMES[Math.floor(rng() * COG_NAMES.length)];
+  ogCog[og] = cog;
+  cogCount.set(cog, (cogCount.get(cog) ?? 0) + 1);
+}
+// categories ordered by frequency, most common first (ties keep the fixed order)
+const cogCategories = [...COG_NAMES].sort(
+  (a, b) => (cogCount.get(b)! - cogCount.get(a)!) || COG_NAMES.indexOf(a) - COG_NAMES.indexOf(b),
+);
+const cogIndex = new Map(cogCategories.map((c, i) => [c, i]));
+
+const genomeCladeName: string[] = new Array(N_G);
+const genomeGc: number[] = new Array(N_G);
+for (let r = 0; r < N_G; r++) {
+  genomeCladeName[r] = `clade${genomeClade[r]}`;
+  genomeGc[r] = Number((0.35 + 0.06 * rng()).toFixed(4));
+}
+const metaAnnotations = [
+  {name: 'description', kind: 'text' as const},
+  {name: 'cog_category', kind: 'categorical' as const, categories: cogCategories},
+];
+const metaGenomeMetadata = [
+  {name: 'clade', kind: 'categorical' as const, categories: [...new Set(genomeCladeName)]},
+  {name: 'gc', kind: 'numeric' as const, min: 0.35, max: 0.41},
+];
+
+// pattern ids: identical presence columns share one
+const ogPatternId = new Int32Array(N_OG);
+const patternGroups = new Map<string, number[]>();
+function ogSignature(og: number): string {
+  let s = '';
+  for (let r = 0; r < N_G; r++) s += presence[r * N_OG + og];
+  return s;
+}
+for (let og = 0; og < N_OG; og++) {
+  const sig = ogSignature(og);
+  let members = patternGroups.get(sig);
+  if (!members) {
+    members = [];
+    patternGroups.set(sig, members);
+    ogPatternId[og] = patternGroups.size - 1;
+  } else {
+    ogPatternId[og] = ogPatternId[members[0]];
+  }
+  members.push(og);
+}
+const patternSize = (og: number) => patternGroups.get(ogSignature(og))!.length;
+
 // --- API helpers ------------------------------------------------------------
 function json(obj: unknown): Response {
   return new Response(JSON.stringify(obj), {headers: {'content-type': 'application/json'}});
@@ -275,7 +331,16 @@ function validateWindow(og0: number, og1: number, g0: number, g1: number, w: num
   if (w * h > MAX_CELLS_TOTAL) return `w*h exceeds ${MAX_CELLS_TOTAL} output cells`;
   return null;
 }
-function matrixResponse(perm: number[], og0: number, og1: number, g0: number, g1: number, w: number, h: number): Response {
+function matrixResponse(
+  perm: number[],
+  og0: number,
+  og1: number,
+  g0: number,
+  g1: number,
+  w: number,
+  h: number,
+  value: 'presence' | 'copies',
+): Response {
   const L = og1 - og0;
   const M = g1 - g0;
   const outW = Math.min(w, L);
@@ -289,14 +354,21 @@ function matrixResponse(perm: number[], og0: number, og1: number, g0: number, g1
       const p1 = og0 + Math.floor(((i + 1) * L) / outW);
       let present = 0;
       let total = 0;
+      let copySum = 0;
       for (let r = r0; r < r1; r++) {
         const base = r * N_OG;
         for (let p = p0; p < p1; p++) {
+          const og = perm[p];
           total++;
-          present += presence[base + perm[p]];
+          present += presence[base + og];
+          copySum += copies[base + og];
         }
       }
-      out[j * outW + i] = total ? Math.round((present / total) * 255) : 0;
+      if (value === 'copies') {
+        out[j * outW + i] = present ? Math.min(255, Math.round((10 * copySum) / present)) : 0;
+      } else {
+        out[j * outW + i] = total ? Math.round((present / total) * 255) : 0;
+      }
     }
   }
   return new Response(out, {
@@ -306,6 +378,72 @@ function matrixResponse(perm: number[], og0: number, og1: number, g0: number, g1
       'X-Height': String(outH),
     },
   });
+}
+
+function annotationTrackResponse(
+  perm: number[],
+  og0: number,
+  og1: number,
+  w: number,
+  name: string,
+): Response {
+  const L = og1 - og0;
+  const outW = Math.min(w, L);
+  const out = new Uint16Array(outW);
+  for (let i = 0; i < outW; i++) {
+    const p0 = og0 + Math.floor((i * L) / outW);
+    const p1 = og0 + Math.floor(((i + 1) * L) / outW);
+    const counts = new Map<string, number>();
+    for (let p = p0; p < p1; p++) {
+      const c = ogCog[perm[p]];
+      counts.set(c, (counts.get(c) ?? 0) + 1);
+    }
+    let best = '';
+    let bestN = -1;
+    for (const c of cogCategories) {
+      const n = counts.get(c) ?? 0;
+      if (n > bestN) {
+        bestN = n;
+        best = c;
+      }
+    }
+    out[i] = bestN > 0 ? 1 + cogIndex.get(best)! : 0;
+  }
+  return new Response(out, {
+    headers: {'content-type': 'application/octet-stream', 'X-Width': String(outW)},
+  });
+}
+
+function computeHits(term: string, perm: number[]): {orthogroup: string; og_idx: number; position: number; field: string; text: string}[] {
+  const posOf = new Int32Array(N_OG);
+  perm.forEach((og, pos) => (posOf[og] = pos));
+  const needle = term.toLowerCase();
+  const hits: {orthogroup: string; og_idx: number; position: number; field: string; text: string}[] = [];
+  for (let og = 0; og < N_OG; og++) {
+    const id = `OG${String(og).padStart(7, '0')}`;
+    let field = '';
+    let text = '';
+    if (id.toLowerCase().includes(needle)) {
+      field = 'orthogroup';
+      text = id;
+    } else if (ogDescription[og].toLowerCase().includes(needle)) {
+      field = 'description';
+      text = ogDescription[og];
+    } else if (ogCog[og].toLowerCase().includes(needle)) {
+      field = 'cog_category';
+      text = ogCog[og];
+    }
+    if (field) hits.push({orthogroup: id, og_idx: og, position: posOf[og], field, text});
+  }
+  hits.sort((a, b) => a.position - b.position);
+  return hits;
+}
+
+function searchResponse(q: string, order: string, limit: number): Response {
+  const perm = resolveOrder(order);
+  if (!perm) return bad(404, `unknown order: ${order}`);
+  const hits = computeHits(q, perm);
+  return json({hits: hits.slice(0, limit), total: hits.length});
 }
 
 function tracksResponse(perm: number[], og0: number, og1: number, w: number, names: string[]): Response {
@@ -339,13 +477,16 @@ function tracksResponse(perm: number[], og0: number, og1: number, w: number, nam
 
 function orthogroupDetails(ogIdx: number): Response {
   const og = `OG${String(ogIdx).padStart(7, '0')}`;
-  const members: {genome: string; genes: string[]}[] = [];
+  const members: {genome: string; genes: {id: string; raw: string}[]}[] = [];
   for (let r = 0; r < N_G; r++) {
     if (presence[r * N_OG + ogIdx]) {
       const c = copies[r * N_OG + ogIdx];
       members.push({
         genome: genomeNames[r],
-        genes: Array.from({length: c}, (_, k) => `gnl|${genomeNames[r]}_${String(ogIdx).padStart(6, '0')}_${k + 1}`),
+        genes: Array.from({length: c}, (_, k) => {
+          const raw = `gnl|extdb|${genomeNames[r]}_${String(ogIdx).padStart(6, '0')}_${k + 1}`;
+          return {id: raw.replace(/^gnl\|[^|]+\|/, ''), raw};
+        }),
       });
     }
   }
@@ -360,7 +501,23 @@ function orthogroupDetails(ogIdx: number): Response {
       copy_number_mean: Number.isNaN(cnMean[ogIdx]) ? null : cnMean[ogIdx],
       geometric_homogeneity: Number.isNaN(geom[ogIdx]) ? null : geom[ogIdx],
     },
+    annotations: {description: ogDescription[ogIdx], cog_category: ogCog[ogIdx]},
+    pattern_id: ogPatternId[ogIdx],
+    n_same_pattern: patternSize(ogIdx),
     members,
+  });
+}
+
+function patternResponse(ogIdx: number): Response {
+  const members = patternGroups.get(ogSignature(ogIdx))!;
+  return json({
+    pattern_id: ogPatternId[ogIdx],
+    total: members.length,
+    orthogroups: members.map((og) => ({
+      orthogroup: `OG${String(og).padStart(7, '0')}`,
+      og_idx: og,
+      annotations: {description: ogDescription[og], cog_category: ogCog[og]},
+    })),
   });
 }
 
@@ -381,6 +538,9 @@ const server = Bun.serve({
         tree_source: 'mock',
         orders: Object.keys(orders),
         tracks: Object.keys(trackData).map(trackInfo),
+        annotations: metaAnnotations,
+        genome_metadata: metaGenomeMetadata,
+        detail: {},
       });
     }
     if (p === '/api/genomes') {
@@ -394,7 +554,14 @@ const server = Bun.serve({
             nGenes += c;
           }
         }
-        return {row, genome_idx: row, name, n_orthogroups: nOG, n_genes: nGenes};
+        return {
+          row,
+          genome_idx: row,
+          name,
+          n_orthogroups: nOG,
+          n_genes: nGenes,
+          metadata: {clade: genomeCladeName[row], gc: genomeGc[row]},
+        };
       });
       return json(list);
     }
@@ -405,6 +572,7 @@ const server = Bun.serve({
       const order = q.get('order') ?? 'tree';
       const perm = resolveOrder(order);
       if (!perm) return bad(404, `unknown order: ${order}`);
+      const value = q.get('value') === 'copies' ? 'copies' : 'presence';
       const og0 = intParam(q, 'og0', 0);
       const og1 = intParam(q, 'og1', N_OG);
       const g0 = intParam(q, 'g0', 0);
@@ -413,7 +581,32 @@ const server = Bun.serve({
       const h = intParam(q, 'h', 0);
       const e = validateWindow(og0, og1, g0, g1, w, h);
       if (e) return bad(400, e);
-      return matrixResponse(perm, og0, og1, g0, g1, w, h);
+      return matrixResponse(perm, og0, og1, g0, g1, w, h, value);
+    }
+    if (p === '/api/annotation-track') {
+      const order = q.get('order') ?? 'tree';
+      const perm = resolveOrder(order);
+      if (!perm) return bad(404, `unknown order: ${order}`);
+      const name = q.get('name') ?? '';
+      const info = metaAnnotations.find((a) => a.name === name);
+      if (!info) return bad(404, `unknown annotation: ${name}`);
+      if (info.kind !== 'categorical') return bad(400, `not a categorical annotation: ${name}`);
+      const og0 = intParam(q, 'og0', 0);
+      const og1 = intParam(q, 'og1', N_OG);
+      const w = intParam(q, 'w', 0);
+      if (!(Number.isInteger(og0) && Number.isInteger(og1) && 0 <= og0 && og0 < og1 && og1 <= N_OG)) {
+        return bad(400, 'window out of range');
+      }
+      if (!(Number.isInteger(w) && 1 <= w && w <= MAX_CELLS)) return bad(400, `w must be in 1..${MAX_CELLS}`);
+      if (w > og1 - og0) return bad(400, 'w exceeds window size');
+      return annotationTrackResponse(perm, og0, og1, w, name);
+    }
+    if (p === '/api/search') {
+      const term = (q.get('q') ?? '').trim();
+      if (!term) return bad(400, 'q is required');
+      const order = q.get('order') ?? 'tree';
+      const limit = Math.min(500, Math.max(1, intParam(q, 'limit', 50)));
+      return searchResponse(term, order, limit);
     }
     if (p === '/api/tracks') {
       const order = q.get('order') ?? 'tree';
@@ -447,10 +640,13 @@ const server = Bun.serve({
       return json(ids);
     }
     if (p.startsWith('/api/orthogroup/')) {
-      const id = decodeURIComponent(p.slice('/api/orthogroup/'.length));
+      const rest = p.slice('/api/orthogroup/'.length);
+      const isPattern = rest.endsWith('/pattern');
+      const id = decodeURIComponent(isPattern ? rest.slice(0, -'/pattern'.length) : rest);
       const m = /^OG(\d+)$/.exec(id);
       if (!m || Number(m[1]) >= N_OG) return bad(404, `unknown orthogroup: ${id}`);
-      return orthogroupDetails(Number(m[1]));
+      const ogIdx = Number(m[1]);
+      return isPattern ? patternResponse(ogIdx) : orthogroupDetails(ogIdx);
     }
     if (p === '/api/orders' && req.method === 'POST') {
       const length = req.headers.get('content-length');
@@ -462,14 +658,34 @@ const server = Bun.serve({
         return bad(400, 'invalid JSON body');
       }
       if (raw.length > MAX_BODY) return bad(413, 'request body too large');
-      let body: {by?: unknown; genomes?: unknown};
+      let body: {by?: unknown; genomes?: unknown; q?: unknown; og?: unknown};
       try {
-        body = JSON.parse(raw) as {by?: unknown; genomes?: unknown};
+        body = JSON.parse(raw) as {by?: unknown; genomes?: unknown; q?: unknown; og?: unknown};
       } catch {
         return bad(400, 'invalid JSON body');
       }
-      if (!body || typeof body !== 'object' || body.by !== 'contrast') {
-        return bad(400, "only 'contrast' orders are supported");
+      if (!body || typeof body !== 'object') return bad(400, 'invalid JSON body');
+      const by = body.by;
+      if (by === 'search') {
+        const term = body.q;
+        if (typeof term !== 'string' || !term.trim()) return bad(400, "'q' must be a non-empty string");
+        const hitSet = new Set(computeHits(term, orders.tree).map((h) => h.og_idx));
+        const perm = [...orders.tree.filter((og) => hitSet.has(og)), ...orders.tree.filter((og) => !hitSet.has(og))];
+        const id = `search-${++dynamicId}`;
+        orders[id] = perm;
+        return json({order: id});
+      }
+      if (by === 'pattern') {
+        const idm = typeof body.og === 'string' ? /^OG(\d+)$/.exec(body.og) : null;
+        if (!idm || Number(idm[1]) >= N_OG) return bad(400, "'og' must be a known orthogroup id");
+        const set = new Set(patternGroups.get(ogSignature(Number(idm[1])))!);
+        const perm = [...orders.tree.filter((og) => set.has(og)), ...orders.tree.filter((og) => !set.has(og))];
+        const id = `pattern-${++dynamicId}`;
+        orders[id] = perm;
+        return json({order: id});
+      }
+      if (by !== 'contrast') {
+        return bad(400, "unsupported order; expected 'contrast', 'search' or 'pattern'");
       }
       const names = body.genomes;
       if (!Array.isArray(names) || names.length === 0 || !names.every((n) => typeof n === 'string')) {

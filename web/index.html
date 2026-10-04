@@ -7,7 +7,7 @@
     <title>OrthoPan</title>
     <style>
       :root {
-        --tree-w: 220px;
+        --tree-w: 200px;
         --label-w: 170px;
         --track-h: 68px;
         --border: #d0d5dd;
@@ -18,18 +18,44 @@
         font: 12px/1.35 system-ui, -apple-system, Segoe UI, sans-serif; color: #1f2937; }
       #app { display: flex; flex-direction: column; height: 100%; }
 
-      #topbar { display: flex; align-items: center; gap: 10px; padding: 6px 10px;
+      #topbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px; padding: 5px 10px;
         border-bottom: 1px solid var(--border); background: var(--panel); z-index: 5; }
       #topbar h1 { font-size: 13px; margin: 0 8px 0 0; font-weight: 600; }
       #topbar label { color: #475467; }
-      #topbar select, #topbar button { font: inherit; padding: 3px 6px; }
+      #topbar select, #topbar button, #topbar input { font: inherit; padding: 3px 6px; }
       #topbar button { cursor: pointer; }
       #status { margin-left: auto; color: #667085; white-space: nowrap; }
-      #notice { color: #b54708; white-space: nowrap; max-width: 40ch; overflow: hidden; text-overflow: ellipsis; }
-      #legend { display: inline-block; width: 110px; height: 10px; border: 1px solid var(--border);
-        vertical-align: middle; border-radius: 2px; }
+      #notice { color: #b54708; white-space: nowrap; max-width: 34ch; overflow: hidden; text-overflow: ellipsis; }
+      #legend { display: inline-flex; align-items: stretch; height: 12px; border: 1px solid var(--border);
+        border-radius: 2px; overflow: hidden; vertical-align: middle; }
+      #legend span { display: inline-block; min-width: 14px; line-height: 10px; font-size: 8px;
+        text-align: center; color: #1f2937; }
       #sortbtn { display: none; }
       #sortbtn.visible { display: inline-block; }
+
+      #search-wrap { position: relative; }
+      #search { width: 180px; }
+      #search-results { position: absolute; top: 100%; left: 0; min-width: 300px; max-height: 340px;
+        overflow: auto; background: #fff; border: 1px solid var(--border); border-radius: 4px;
+        box-shadow: 0 6px 18px rgba(0,0,0,0.12); display: none; z-index: 30; }
+      #search-results.visible { display: block; }
+      #search-results .total { padding: 4px 8px; color: #667085; font-size: 11px; border-bottom: 1px solid #eef2f6; }
+      #search-results ul { margin: 0; padding: 0; list-style: none; }
+      #search-results li { padding: 4px 8px; cursor: pointer; white-space: nowrap;
+        overflow: hidden; text-overflow: ellipsis; }
+      #search-results li:hover { background: #eff4ff; }
+      #search-results .field { color: #667085; }
+      #search-results .snippet { color: #475467; }
+
+      #layers { position: relative; }
+      #layers summary { cursor: pointer; color: #475467; }
+      #layer-list { position: absolute; right: 0; top: 100%; background: #fff; border: 1px solid var(--border);
+        border-radius: 4px; box-shadow: 0 6px 18px rgba(0,0,0,0.12); padding: 6px 10px; min-width: 210px;
+        max-height: 360px; overflow: auto; z-index: 30; }
+      #layer-list h4 { margin: 6px 0 2px; font-size: 11px; color: #667085; }
+      #layer-list label { display: block; white-space: nowrap; }
+      #layer-list .swatch { display: inline-block; width: 10px; height: 10px; border: 1px solid rgba(0,0,0,0.15);
+        vertical-align: middle; margin-right: 4px; border-radius: 2px; }
 
       #body { display: flex; flex: 1; min-height: 0; position: relative; }
       #tree-col { width: var(--tree-w); flex: 0 0 var(--tree-w); position: relative;
@@ -38,17 +64,23 @@
         width: 100%; height: calc(100% - var(--track-h)); }
       #tree-spacer { height: var(--track-h); border-bottom: 1px solid var(--border); }
 
+      #meta-col { position: relative; border-right: 1px solid var(--border); }
+      #meta-col canvas { position: absolute; left: 0; right: 0; top: var(--track-h); bottom: 0;
+        width: 100%; height: calc(100% - var(--track-h)); }
+      #meta-spacer { height: var(--track-h); border-bottom: 1px solid var(--border); }
+
       #center { flex: 1; min-width: 0; display: flex; flex-direction: column; }
       #tracks { height: var(--track-h); flex: 0 0 var(--track-h); position: relative;
         border-bottom: 1px solid var(--border); }
       #tracks canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
       #matrix-wrap { position: relative; flex: 1; min-height: 0; overflow: hidden; }
       #deck { position: absolute; inset: 0; }
-      #overlay { position: absolute; inset: 0; pointer-events: none; }
-      #tooltip { position: absolute; pointer-events: none; display: none; z-index: 10;
+      #overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+      #tooltip { position: fixed; pointer-events: none; display: none; z-index: 40;
         background: rgba(17,24,39,0.92); color: #f9fafb; padding: 5px 7px; border-radius: 4px;
-        font-size: 11px; max-width: 320px; white-space: nowrap; }
+        font-size: 11px; max-width: 340px; white-space: nowrap; }
       #tooltip b { color: #93c5fd; font-weight: 600; }
+      #tooltip .tip-dim { color: #cbd5e1; }
 
       #labels-col { width: var(--label-w); flex: 0 0 var(--label-w); position: relative;
         border-left: 1px solid var(--border); }
@@ -58,17 +90,20 @@
       #labels-spacer { height: var(--track-h); border-bottom: 1px solid var(--border); }
 
       /* overlay the matrix side only: the label column stays visible as the panel's right edge */
-      #panel { position: absolute; top: 0; right: var(--label-w); bottom: 0; width: 340px;
+      #panel { position: absolute; top: 0; right: var(--label-w); bottom: 0; width: 380px;
         background: #fff; border-left: 1px solid var(--border); box-shadow: -4px 0 12px rgba(0,0,0,0.08);
         overflow: auto; padding: 10px 12px; display: none; z-index: 20; }
       #panel.visible { display: block; }
-      #panel h2 { font-size: 13px; margin: 0 0 6px; }
+      #panel h2 { font-size: 13px; margin: 10px 0 6px; }
+      #panel h2:first-child { margin-top: 0; }
       #panel .close { float: right; cursor: pointer; border: none; background: none; font-size: 16px; }
       #panel table { border-collapse: collapse; width: 100%; margin: 6px 0; }
       #panel td { padding: 2px 4px; border-bottom: 1px solid #eef2f6; vertical-align: top; }
       #panel td:first-child { color: #667085; white-space: nowrap; }
       #panel ul { margin: 4px 0 0; padding-left: 16px; max-height: 40%; overflow: auto; }
       #panel code { background: #f2f4f7; padding: 0 3px; border-radius: 3px; }
+      #panel .linkish { color: #2563eb; cursor: pointer; }
+      #panel .linkish:hover { text-decoration: underline; }
     </style>
   </head>
   <body>
@@ -78,14 +113,29 @@
         <label for="order">Order</label>
         <select id="order"></select>
         <button id="sortbtn" title="Sort orthogroups by presence contrast inside the selected clade">sort by contrast</button>
+        <label for="mode">Value</label>
+        <select id="mode">
+          <option value="presence">presence</option>
+          <option value="copies">copies</option>
+        </select>
+        <span id="legend" title="Cell colour scale"></span>
+        <span id="search-wrap">
+          <input id="search" type="search" placeholder="search annotations / OG…" autocomplete="off" />
+          <button id="search-order" title="Order orthogroups with the search hits first">Order by hits</button>
+          <div id="search-results"></div>
+        </span>
+        <details id="layers"><summary>Layers</summary><div id="layer-list"></div></details>
         <span id="notice"></span>
-        <span id="legend" title="Presence fraction: left = absent, right = present"></span>
         <span id="status">loading…</span>
       </div>
       <div id="body">
         <div id="tree-col">
           <div id="tree-spacer"></div>
           <canvas id="tree"></canvas>
+        </div>
+        <div id="meta-col">
+          <div id="meta-spacer"></div>
+          <canvas id="meta"></canvas>
         </div>
         <div id="center">
           <div id="tracks"><canvas id="tracks-canvas"></canvas></div>

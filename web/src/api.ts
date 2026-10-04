@@ -7,12 +7,29 @@ export interface TrackInfo {
   missing: number;
 }
 
+export interface AnnotationInfo {
+  name: string;
+  kind: 'text' | 'categorical';
+  categories?: string[];
+}
+
+export interface GenomeMetadataInfo {
+  name: string;
+  kind: 'categorical' | 'numeric';
+  categories?: string[];
+  min?: number;
+  max?: number;
+}
+
 export interface Meta {
   n_genomes: number;
   n_orthogroups: number;
   tree_source: string;
   orders: string[];
   tracks: TrackInfo[];
+  annotations?: AnnotationInfo[];
+  genome_metadata?: GenomeMetadataInfo[];
+  detail?: Record<string, boolean>;
 }
 
 export interface Genome {
@@ -21,6 +38,7 @@ export interface Genome {
   name: string;
   n_orthogroups: number;
   n_genes: number;
+  metadata?: Record<string, string | number | null>;
 }
 
 export interface TreeArrays {
@@ -34,6 +52,8 @@ export interface MatrixResult {
   data: Uint8Array;
   width: number;
   height: number;
+  /** echo of the requested value mode */
+  value: 'presence' | 'copies';
 }
 
 export interface TracksResult {
@@ -41,6 +61,36 @@ export interface TracksResult {
   /** track names, in the order the server sent them (X-Tracks header) */
   names: string[];
   bins: number;
+}
+
+export interface AnnotationTrackResult {
+  name: string;
+  data: Uint16Array;
+  bins: number;
+}
+
+export interface SearchHit {
+  orthogroup: string;
+  og_idx: number;
+  position: number;
+  field: string;
+  text: string;
+}
+
+export interface SearchResult {
+  hits: SearchHit[];
+  total: number;
+}
+
+export interface PatternResult {
+  pattern_id: number;
+  total: number;
+  orthogroups: {orthogroup: string; og_idx: number; annotations: Record<string, unknown>}[];
+}
+
+export interface MemberGene {
+  id: string;
+  raw: string;
 }
 
 export interface OrthogroupDetails {
@@ -51,9 +101,13 @@ export interface OrthogroupDetails {
   mrca_label: string | null;
   purity: number | null;
   tracks: Record<string, number | null>;
-  members: {genome: string; genes: string[]}[];
+  annotations?: Record<string, unknown>;
+  pattern_id?: number;
+  n_same_pattern?: number;
+  members: {genome: string; genes: MemberGene[]}[];
 }
 
+import {decodeFloat32LE, decodeUint16LE} from './decode';
 export class HttpError extends Error {
   constructor(
     public status: number,
@@ -92,9 +146,11 @@ export interface MatrixParams {
   g1: number;
   w: number;
   h: number;
+  value?: 'presence' | 'copies';
 }
 
 export async function getMatrix(p: MatrixParams, signal?: AbortSignal): Promise<MatrixResult> {
+  const value = p.value ?? 'presence';
   const q = new URLSearchParams({
     order: p.order,
     og0: String(p.og0),
@@ -103,6 +159,7 @@ export async function getMatrix(p: MatrixParams, signal?: AbortSignal): Promise<
     g1: String(p.g1),
     w: String(p.w),
     h: String(p.h),
+    value,
   });
   const res = await fetch(`/api/matrix?${q}`, {signal});
   if (!res.ok) throw new HttpError(res.status, `/api/matrix: HTTP ${res.status}`);
@@ -112,7 +169,7 @@ export async function getMatrix(p: MatrixParams, signal?: AbortSignal): Promise<
   if (buf.byteLength !== width * height) {
     throw new Error(`matrix payload ${buf.byteLength} != ${width}*${height}`);
   }
-  return {data: new Uint8Array(buf), width, height};
+  return {data: new Uint8Array(buf), width, height, value};
 }
 
 export interface TracksParams {
@@ -139,10 +196,36 @@ export async function getTracks(p: TracksParams, signal?: AbortSignal): Promise<
   if (buf.byteLength !== count * 4) {
     throw new Error(`tracks payload ${buf.byteLength} != ${count}*4`);
   }
-  const dv = new DataView(buf);
-  const data = new Float32Array(count);
-  for (let i = 0; i < count; i++) data[i] = dv.getFloat32(i * 4, true);
-  return {data, names, bins: p.w};
+  return {data: decodeFloat32LE(buf), names, bins: p.w};
+}
+
+export interface AnnotationTrackParams {
+  order: string;
+  og0: number;
+  og1: number;
+  w: number;
+  name: string;
+}
+
+export async function getAnnotationTrack(
+  p: AnnotationTrackParams,
+  signal?: AbortSignal,
+): Promise<AnnotationTrackResult> {
+  const q = new URLSearchParams({
+    order: p.order,
+    og0: String(p.og0),
+    og1: String(p.og1),
+    w: String(p.w),
+    name: p.name,
+  });
+  const res = await fetch(`/api/annotation-track?${q}`, {signal});
+  if (!res.ok) throw new HttpError(res.status, `/api/annotation-track: HTTP ${res.status}`);
+  const bins = p.w;
+  const buf = await res.arrayBuffer();
+  if (buf.byteLength !== bins * 2) {
+    throw new Error(`annotation-track payload ${buf.byteLength} != ${bins}*2`);
+  }
+  return {name: p.name, data: decodeUint16LE(buf), bins};
 }
 
 export async function getOrthogroups(
@@ -160,9 +243,21 @@ export function getOrthogroup(og: string, signal?: AbortSignal): Promise<Orthogr
   return getJSON<OrthogroupDetails>(`/api/orthogroup/${encodeURIComponent(og)}`, signal);
 }
 
+export function getPattern(og: string, limit = 200, signal?: AbortSignal): Promise<PatternResult> {
+  const q = new URLSearchParams({limit: String(limit)});
+  return getJSON<PatternResult>(`/api/orthogroup/${encodeURIComponent(og)}/pattern?${q}`, signal);
+}
+
+export async function search(q: string, order: string, limit = 50, signal?: AbortSignal): Promise<SearchResult> {
+  const params = new URLSearchParams({q, order, limit: String(limit)});
+  return getJSON<SearchResult>(`/api/search?${params}`, signal);
+}
+
 export async function postOrder(body: {
   by: string;
   genomes?: string[];
+  q?: string;
+  og?: string;
 }): Promise<{order: string}> {
   const res = await fetch('/api/orders', {
     method: 'POST',

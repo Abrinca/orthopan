@@ -79,6 +79,34 @@ export function computeWindow(v: View, nOG: number, nG: number, pw: number, ph: 
   return {og0, og1, g0, g1, ...capped};
 }
 
+/** Backing-store size for a canvas whose CSS box is cssPw x cssPh at the given dpr. */
+export function backingSize(cssPw: number, cssPh: number, dpr: number): {width: number; height: number} {
+  return {width: Math.max(1, Math.round(cssPw * dpr)), height: Math.max(1, Math.round(cssPh * dpr))};
+}
+
+/**
+ * Size a canvas for DPR-correct drawing: backing store = CSS size x dpr, one
+ * ctx.setTransform(dpr,...) so all drawing is in CSS px. The canvas's CSS box
+ * must already be cssPw x cssPh (callers rely on CSS width/height:100%).
+ */
+export function prepareCanvas(
+  canvas: HTMLCanvasElement,
+  cssPw: number,
+  cssPh: number,
+): CanvasRenderingContext2D | null {
+  const dpr = window.devicePixelRatio || 1;
+  const {width, height} = backingSize(cssPw, cssPh, dpr);
+  if (canvas.width !== width || canvas.height !== height) {
+    canvas.width = width;
+    canvas.height = height;
+  }
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return null;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, cssPw, cssPh);
+  return ctx;
+}
+
 export interface Transform {
   sx: number;
   sy: number;
@@ -111,6 +139,11 @@ export function colRange(win: Window, j: number): [number, number] {
 export function rowRange(win: Window, i: number): [number, number] {
   const M = win.g1 - win.g0;
   return [win.g0 + Math.floor((i * M) / win.h), win.g0 + Math.floor(((i + 1) * M) / win.h)];
+}
+
+/** Floor-rounded range of strip bin `i` over the orthogroup span [start, end). */
+export function binRange(start: number, end: number, bins: number, i: number): [number, number] {
+  return [start + Math.floor((i * (end - start)) / bins), start + Math.floor(((i + 1) * (end - start)) / bins)];
 }
 
 /**

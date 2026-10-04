@@ -1,13 +1,12 @@
 // Genome dendrogram (rectangular cladogram) on a Canvas2D aligned with matrix rows.
 
 import {getTree, type TreeArrays} from './api';
-import type {Transform} from './transform';
+import {prepareCanvas, type Transform} from './transform';
 
 const PAD = 8;
 const HIT_RADIUS = 7; // px
 
 export class Tree {
-  private readonly ctx: CanvasRenderingContext2D;
   private arrays: TreeArrays | null = null;
   private children: number[][] = [];
   private lo: number[] = [];
@@ -19,11 +18,7 @@ export class Tree {
   // cached mapping from the last draw, for hit testing
   private t = {xOf: (_: number) => 0, nodeY: (_: number) => 0};
 
-  constructor(private canvas: HTMLCanvasElement) {
-    const ctx = canvas.getContext('2d');
-    if (!ctx) throw new Error('tree: no 2d context');
-    this.ctx = ctx;
-  }
+  constructor(private canvas: HTMLCanvasElement) {}
 
   async load(): Promise<void> {
     this.arrays = await getTree();
@@ -61,14 +56,8 @@ export class Tree {
   }
 
   draw(tr: Transform, pw: number, ph: number): void {
-    const dpr = window.devicePixelRatio || 1;
-    if (this.canvas.width !== Math.round(pw * dpr) || this.canvas.height !== Math.round(ph * dpr)) {
-      this.canvas.width = Math.round(pw * dpr);
-      this.canvas.height = Math.round(ph * dpr);
-    }
-    const ctx = this.ctx;
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.clearRect(0, 0, pw, ph);
+    const ctx = prepareCanvas(this.canvas, pw, ph);
+    if (!ctx) return;
     if (!this.arrays) return;
 
     const xOf = (d: number) => PAD + (d / this.maxDepth) * (pw - 2 * PAD);

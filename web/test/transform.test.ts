@@ -1,5 +1,6 @@
 import {describe, expect, test} from 'bun:test';
 import {
+  backingSize,
   bufferAt,
   capCellCounts,
   cellRect,
@@ -13,6 +14,19 @@ import {
 } from '../src/transform';
 
 const close = (a: number, b: number, digits = 6) => expect(a).toBeCloseTo(b, digits);
+
+describe('canvas DPR backing store', () => {
+  test('backing store = CSS size x dpr, rounded', () => {
+    expect(backingSize(1010, 792, 1)).toEqual({width: 1010, height: 792});
+    expect(backingSize(1010, 792, 1.5)).toEqual({width: 1515, height: 1188});
+    expect(backingSize(1010, 792, 2)).toEqual({width: 2020, height: 1584});
+    expect(backingSize(1010.6, 792.4, 1.25)).toEqual({width: 1263, height: 991});
+  });
+
+  test('never zero', () => {
+    expect(backingSize(0, 0, 1)).toEqual({width: 1, height: 1});
+  });
+});
 
 describe('transform round-trip', () => {
   const v: View = {cx: 12.3, cy: 4.7, zx: 1.3, zy: -0.4};
