@@ -5,15 +5,20 @@ import {
   getGenomes,
   getMatrix,
   getMeta,
+  getMsa,
+  getGeneTree,
   getOrthogroup,
   getOrthogroups,
   getPattern,
   getTracks,
+  fastaUrl,
+  geneTreeNwkUrl,
   postOrder,
   search as apiSearch,
   type AnnotationTrackResult,
   type Genome,
   type GenomeMetadataInfo,
+  type GeneTreeArrays,
   type MatrixResult,
   type Meta,
   type SearchHit,
@@ -21,8 +26,11 @@ import {
 } from './api';
 import {annotationCategory, categoryColor} from './annotations';
 import {formatCopiesExact, formatCopiesMean} from './decode';
+import {GeneTreeView, MISSING_COLOR, type GeneTreeHover} from './genetree';
+import {Generation} from './generation';
 import {Heatmap, colorForValue, copiesLegend, toImageDataFor} from './matrix';
-import {Metadata, META_COL_W} from './metadata';
+import {Metadata, META_COL_W, numericColor} from './metadata';
+import {MsaView, type MsaHover} from './msa';
 import {PendingCache} from './pending';
 import {SearchBox, hitViewport} from './search';
 import {
@@ -54,6 +62,24 @@ const labelsCanvas = $<HTMLCanvasElement>('labels');
 const overlay = $<HTMLCanvasElement>('overlay');
 const tooltip = $('tooltip');
 const panel = $('panel');
+const drawerTitle = $('drawer-title');
+const drawerClose = $<HTMLButtonElement>('drawer-close');
+const drawerExpand = $<HTMLButtonElement>('drawer-expand');
+const drawerResize = $('drawer-resize');
+const idModeSelect = $<HTMLSelectElement>('id-mode');
+const dlFasta = $<HTMLAnchorElement>('dl-fasta');
+const dlAligned = $<HTMLAnchorElement>('dl-aligned');
+const dlNwk = $<HTMLAnchorElement>('dl-nwk');
+const tabMembers = $('tab-members');
+const msaCanvas = $<HTMLCanvasElement>('msa-canvas');
+const msaStatus = $('msa-status');
+const msaBadges = $('msa-badges');
+const msaRetry = $<HTMLButtonElement>('msa-retry');
+const geneTreeCanvas = $<HTMLCanvasElement>('tree-canvas');
+const treeFieldSelect = $<HTMLSelectElement>('tree-field');
+const treeModeSelect = $<HTMLSelectElement>('tree-mode');
+const treeLegend = $('tree-legend');
+const treeStatus = $('tree-status');
 const orderSelect = $<HTMLSelectElement>('order');
 const modeSelect = $<HTMLSelectElement>('mode');
 const sortBtn = $<HTMLButtonElement>('sortbtn');
@@ -94,12 +120,71 @@ let gen = 0;
 let inflight: AbortController | null = null;
 let fetchTimer = 0;
 let hashTimer = 0;
-let detailSeq = 0;
 let hoverSeq = 0;
+let clickSeq = 0;
+
+// drawer state
+let currentOg: string | null = null;
+let currentTab: 'members' | 'msa' | 'gene-tree' = 'members';
+let highlightRow: number | null = null;
+let msaView: MsaView;
+let geneTreeView: GeneTreeView;
+let treeField = '';
 
 let activeOgs: {order: string; og0: number; ids: string[]} | null = null;
 const ogCache = new Map<string, string[]>();
 const ogAnnoCache = new PendingCache<Record<string, unknown>>(64);
+
+// drawer request lifecycle: one generation guards every pane; changing OG or
+// closing aborts all in-flight drawer requests and discards late responses.
+const drawerGen = new Generation();
+let drawerSignal: AbortSignal = new AbortController().signal;
+const drawerLoaded = {members: null as string | null, msa: null as string | null, tree: null as string | null};
+const treeData = new Map<string, GeneTreeArrays>();
+const treeState = new Map<string, 'ok' | 'missing'>();
+const treeError = new Map<string, string>();
+const treeInflight = new Map<string, Promise<GeneTreeArrays>>();
+
+function beginDrawer(): void {
+  drawerSignal = drawerGen.begin().signal;
+  treeInflight.clear(); // previous requests were aborted; never reuse them
+}
+
+const TREE_CACHE_MAX = 16;
+
+/** Remember a tree result; keeps at most TREE_CACHE_MAX OGs (oldest evicted from all maps). */
+function rememberTree(og: string, data: GeneTreeArrays | null, error?: string): void {
+  treeState.delete(og); // re-insert to mark as most recent
+  treeState.set(og, data ? 'ok' : 'missing');
+  if (data) treeData.set(og, data);
+  if (error !== undefined) treeError.set(og, error);
+  while (treeState.size > TREE_CACHE_MAX) {
+    const oldest = treeState.keys().next().value as string;
+    treeState.delete(oldest);
+    treeData.delete(oldest);
+    treeError.delete(oldest);
+  }
+}
+
+/** Fetch a gene tree once per OG, sharing the in-flight promise. Only a 404 is
+ *  cached as "missing"; aborts and transient errors stay retryable. */
+function fetchTreeData(og: string): Promise<GeneTreeArrays> {
+  let p = treeInflight.get(og);
+  if (!p) {
+    const req: Promise<GeneTreeArrays> = getGeneTree(og, drawerSignal);
+    p = req;
+    treeInflight.set(og, req);
+    req.then(
+      (d) => rememberTree(og, d),
+      (err) => {
+        if (err instanceof HttpError && err.status === 404) rememberTree(og, null, (err as Error).message);
+      },
+    ).finally(() => {
+      if (treeInflight.get(og) === req) treeInflight.delete(og);
+    });
+  }
+  return p;
+}
 
 function dims(): {pw: number; ph: number} {
   return {pw: matrixWrap.clientWidth, ph: matrixWrap.clientHeight};
@@ -126,6 +211,9 @@ async function boot(): Promise<void> {
   await tree.load();
   tracks = new Tracks(tracksCanvas);
   metadata = new Metadata(metaCanvas);
+  msaView = new MsaView(msaCanvas, onMsaHover);
+  geneTreeView = new GeneTreeView(geneTreeCanvas, onTreeHover, onLeafHover);
+  setupDrawer();
 
   metaFields = meta.genome_metadata ?? [];
   const metaW = metaFields.length * META_COL_W;
@@ -186,6 +274,8 @@ function onDprChange(): void {
   watchDevicePixelRatio();
   heatmap?.resyncDpr();
   render();
+  msaView?.draw();
+  geneTreeView?.draw();
 }
 
 function checkDevicePixelRatio(): void {
@@ -277,7 +367,6 @@ function setOrder(o: string): void {
   lastAnnos = null;
   lastAnnoWorld = null;
   hover = null;
-  detailSeq++;
   hideTooltip();
   scheduleRender();
   scheduleHash();
@@ -533,6 +622,14 @@ function drawOverlay(tr: ReturnType<typeof makeTransform>, pw: number, ph: numbe
   if (!ctx) return;
 
   drawCladeTint(ctx, tr, pw);
+
+  // gene-tree leaf hover highlights that genome's matrix row
+  if (highlightRow !== null) {
+    ctx.fillStyle = 'rgba(220,38,38,0.14)';
+    const y0 = tr.yOf(highlightRow);
+    const y1 = tr.yOf(highlightRow + 1);
+    ctx.fillRect(0, y0, pw, y1 - y0);
+  }
 
   // search-hit highlight
   if (highlight && performance.now() < highlight.until) {
@@ -806,20 +903,20 @@ async function onClick(e: MouseEvent): Promise<void> {
     notice('zoom in until the cell covers a single orthogroup to open it');
     return;
   }
-  const my = ++detailSeq;
+  const my = ++clickSeq;
   const pos = hit.og;
   let og = ogAt(pos);
   if (!og) {
     try {
       const ids = await getOrthogroups(order, pos, pos + 1);
-      if (my !== detailSeq) return;
+      if (my !== clickSeq) return;
       og = ids[0] ?? null;
     } catch {
       og = null;
     }
   }
-  if (my !== detailSeq || !og) return;
-  await openPanel(og, my);
+  if (my !== clickSeq || !og) return;
+  openDrawer(og);
 }
 
 // --- search / jumps ---------------------------------------------------------
@@ -869,15 +966,203 @@ async function orderByHits(q: string): Promise<void> {
   }
 }
 
-// --- panel ------------------------------------------------------------------
+// --- detail drawer ----------------------------------------------------------
 
-async function openPanel(og: string, my: number): Promise<void> {
-  panel.classList.add('visible');
-  panel.innerHTML = '<button class="close" aria-label="close">×</button><h2>loading…</h2>';
-  panel.querySelector('.close')!.addEventListener('click', closePanel);
+function setupDrawer(): void {
+  document.querySelectorAll<HTMLButtonElement>('#panel .tab').forEach((b) => {
+    b.addEventListener('click', () => setDrawerTab(b.dataset.tab as DrawerTab));
+  });
+  drawerClose.addEventListener('click', closeDrawer);
+  drawerExpand.addEventListener('click', () => {
+    panel.classList.toggle('expanded');
+    panel.style.width = '';
+    saveDrawerState();
+    msaView.draw();
+    geneTreeView.draw();
+  });
+  idModeSelect.addEventListener('change', () => {
+    updateDownloads();
+    updateNwkLink();
+  });
+  const fields = meta.genome_metadata ?? [];
+  treeFieldSelect.innerHTML =
+    '<option value="">genome identity</option>' +
+    fields.map((f) => `<option value="${esc(f.name)}">${esc(f.name)} (${esc(f.kind)})</option>`).join('');
+  const firstCat = fields.find((f) => f.kind === 'categorical');
+  treeField = firstCat ? firstCat.name : '';
+  treeFieldSelect.value = treeField;
+  renderTreeLegend();
+  treeFieldSelect.addEventListener('change', () => {
+    treeField = treeFieldSelect.value;
+    renderTreeLegend();
+    geneTreeView.setSpec(metaFields.find((f) => f.name === treeField));
+  });
+  treeModeSelect.addEventListener('change', () => {
+    geneTreeView.setMode(treeModeSelect.value as 'phylogram' | 'cladogram');
+  });
+  $('msa-zoom-in').addEventListener('click', () => msaView.zoomBy(1.5));
+  $('msa-zoom-out').addEventListener('click', () => msaView.zoomBy(1 / 1.5));
+  $('tree-zoom-in').addEventListener('click', () => geneTreeView.zoomBy(1.25));
+  $('tree-zoom-out').addEventListener('click', () => geneTreeView.zoomBy(1 / 1.25));
+  msaRetry.addEventListener('click', () => {
+    if (currentOg) void renderMsa(currentOg);
+  });
+  // restore persisted drawer width / expanded state
   try {
-    const d = await getOrthogroup(og);
-    if (my !== detailSeq) return;
+    const w = Number(localStorage.getItem('orthopan.drawerWidth'));
+    if (Number.isFinite(w) && w >= 300) panel.style.width = `${Math.min(window.innerWidth * 0.9, w)}px`;
+    if (localStorage.getItem('orthopan.drawerExpanded') === '1') panel.classList.add('expanded');
+  } catch {
+    /* storage unavailable */
+  }
+  // cheap horizontal resize of the drawer
+  drawerResize.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startW = panel.offsetWidth;
+    const move = (ev: PointerEvent) => {
+      panel.classList.remove('expanded');
+      panel.style.width = `${Math.max(300, Math.min(window.innerWidth * 0.9, startW + (startX - ev.clientX)))}px`;
+      msaView.draw();
+      geneTreeView.draw();
+    };
+    const up = () => {
+      saveDrawerState();
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', up);
+    };
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', up);
+  });
+  // Esc closes the drawer unless an input/select/textarea has focus
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape') return;
+    const tag = (document.activeElement as HTMLElement | null)?.tagName;
+    if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
+    if (panel.classList.contains('visible')) {
+      e.preventDefault();
+      closeDrawer();
+    }
+  });
+  // back button / hand-edited hash opens the OG and tab
+  window.addEventListener('hashchange', onHashChange);
+}
+
+function saveDrawerState(): void {
+  try {
+    localStorage.setItem('orthopan.drawerWidth', String(panel.offsetWidth));
+    localStorage.setItem('orthopan.drawerExpanded', panel.classList.contains('expanded') ? '1' : '0');
+  } catch {
+    /* storage unavailable */
+  }
+}
+
+function renderTreeLegend(): void {
+  const spec = (meta?.genome_metadata ?? []).find((f) => f.name === treeField);
+  let html = '';
+  if (!spec || spec.kind === 'categorical') {
+    const cats = (spec?.categories ?? []).slice(0, 16);
+    html = cats.map((c, i) => `<span class="lg"><i style="background:${categoryColor(i)}"></i>${esc(c)}</span>`).join('');
+    if (spec) html += `<span class="lg"><i style="background:${MISSING_COLOR}"></i>missing</span>`;
+    if (!html) html = `<span class="lg">genome identity</span>`;
+  } else {
+    const stops = [0, 0.25, 0.5, 0.75, 1].map((f) => `<i style="background:${numericColor(f)}"></i>`).join('');
+    html = `<span class="lg">${fmt3(spec.min ?? 0)}${stops}${fmt3(spec.max ?? 1)}</span><span class="lg"><i style="background:${MISSING_COLOR}"></i>missing</span>`;
+  }
+  html += `<span class="lg"><i class="dup"></i>duplication</span>`;
+  treeLegend.innerHTML = html;
+}
+
+type DrawerTab = 'members' | 'msa' | 'gene-tree';
+
+function openDrawer(og: string, tab?: DrawerTab): void {
+  const changed = og !== currentOg;
+  if (changed) {
+    beginDrawer();
+    drawerLoaded.members = drawerLoaded.msa = drawerLoaded.tree = null;
+    clearDrawerPanes();
+    currentOg = og;
+    drawerTitle.textContent = og;
+    updateDownloads();
+    updateNwkLink();
+    probeTree(og);
+  }
+  panel.classList.add('visible');
+  setDrawerTab(tab ?? currentTab);
+}
+
+function clearDrawerPanes(): void {
+  tabMembers.innerHTML = '';
+  msaView.setData(null);
+  msaStatus.textContent = '';
+  msaBadges.innerHTML = '';
+  msaRetry.hidden = true;
+  geneTreeView.setData(null, genomes, undefined);
+  treeStatus.textContent = '';
+  highlightRow = null;
+  hideTooltip();
+  renderOverlayNow();
+}
+
+function setDrawerTab(tab: DrawerTab): void {
+  currentTab = tab;
+  document.querySelectorAll<HTMLButtonElement>('#panel .tab').forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
+  document.querySelectorAll<HTMLElement>('#panel .tab-pane').forEach((p) => p.classList.toggle('active', p.id === `tab-${tab}`));
+  scheduleHash();
+  const og = currentOg;
+  if (!og) return;
+  if (tab === 'members') {
+    if (drawerLoaded.members !== og) void renderMembers(og);
+  } else if (tab === 'msa') {
+    if (drawerLoaded.msa !== og) void renderMsa(og);
+    else msaView.draw();
+  } else {
+    if (drawerLoaded.tree !== og) void renderGeneTree(og);
+    else geneTreeView.draw();
+  }
+}
+
+function updateDownloads(): void {
+  if (!currentOg) return;
+  const ids = idModeSelect.value === 'raw' ? 'raw' : 'display';
+  dlFasta.href = fastaUrl(currentOg, false, ids);
+  dlAligned.href = fastaUrl(currentOg, true, ids);
+  dlNwk.href = geneTreeNwkUrl(currentOg, ids);
+}
+
+/** Enable/disable the Newick link from what we already know about the OG. */
+function updateNwkLink(): void {
+  if (!currentOg) return;
+  updateDownloads();
+  const enabled = treeState.get(currentOg) !== 'missing';
+  dlNwk.classList.toggle('disabled', !enabled);
+  dlNwk.setAttribute('aria-disabled', enabled ? 'false' : 'true');
+  if (!enabled) dlNwk.removeAttribute('href');
+}
+
+/** In the background, find out whether the OG has a gene tree so the Newick
+ *  link can be disabled before the user clicks it. */
+function probeTree(og: string): void {
+  if (treeState.has(og)) {
+    updateNwkLink();
+    return;
+  }
+  fetchTreeData(og).then(
+    () => {
+      if (currentOg === og) updateNwkLink();
+    },
+    () => {
+      if (currentOg === og) updateNwkLink();
+    },
+  );
+}
+
+async function renderMembers(og: string): Promise<void> {
+  const my = drawerGen.current;
+  tabMembers.innerHTML = '<h2>loading…</h2>';
+  try {
+    const d = await getOrthogroup(og, drawerSignal);
+    if (!drawerGen.isCurrent(my) || og !== currentOg) return;
     const trackRows = Object.entries(d.tracks ?? {})
       .map(([k, v]) => `<tr><td>${esc(k)}</td><td>${v === null || v === undefined ? '—' : fmt3(v)}</td></tr>`)
       .join('');
@@ -885,11 +1170,20 @@ async function openPanel(og: string, my: number): Promise<void> {
       .map(([k, v]) => `<tr><td>${esc(k)}</td><td>${esc(fmtVal(v))}</td></tr>`)
       .join('');
     const members = (d.members ?? [])
-      .map((m) => `<li><code title="${esc(m.genes.map((g) => g.raw).join(', '))}">${esc(m.genome)}</code> — ${m.genes.map((g) => esc(g.id)).join(', ')}</li>`)
+      .map(
+        (m) =>
+          `<li class="genome-group"><b>${esc(m.genome)}</b><ul>` +
+          m.genes
+            .map(
+              (g) =>
+                `<li><code title="${esc(g.raw)}">${esc(g.id)}</code> ` +
+                `<button class="copyid" data-id="${esc(g.raw)}" title="copy raw id">copy</button></li>`,
+            )
+            .join('') +
+          `</ul></li>`,
+      )
       .join('');
-    panel.innerHTML = `
-      <button class="close" aria-label="close">×</button>
-      <h2>${esc(d.orthogroup)}</h2>
+    tabMembers.innerHTML = `
       <table>
         <tr><td>og_idx</td><td>${d.og_idx}</td></tr>
         <tr><td>genomes</td><td>${d.n_genomes}</td></tr>
@@ -900,25 +1194,137 @@ async function openPanel(og: string, my: number): Promise<void> {
         ${annoRows}
         ${trackRows}
       </table>
-      <h2>members (${d.members?.length ?? 0})</h2>
-      <ul>${members}</ul>
+      <h2>member genomes (${d.members?.length ?? 0})</h2>
+      <ul class="genome-list">${members}</ul>
       <div id="pattern-section"></div>`;
-    panel.querySelector('.close')!.addEventListener('click', closePanel);
+    tabMembers.querySelectorAll<HTMLButtonElement>('.copyid').forEach((b) => {
+      b.addEventListener('click', () => {
+        const id = b.dataset.id ?? '';
+        navigator.clipboard?.writeText(id).then(
+          () => notice(`copied ${id}`),
+          () => notice('copy failed'),
+        );
+      });
+    });
+    drawerLoaded.members = og;
     void loadPattern(d.orthogroup, my);
   } catch (err) {
-    if (my !== detailSeq) return;
-    panel.innerHTML = `<button class="close">×</button><h2>error</h2><p>${esc((err as Error).message)}</p>`;
-    panel.querySelector('.close')!.addEventListener('click', closePanel);
+    if (!drawerGen.isCurrent(my) || og !== currentOg) return;
+    tabMembers.innerHTML = `<h2>error</h2><p>${esc((err as Error).message)}</p>`;
   }
+}
+
+async function renderMsa(og: string): Promise<void> {
+  const my = drawerGen.current;
+  msaStatus.textContent = 'loading…';
+  msaBadges.innerHTML = '';
+  msaRetry.hidden = true;
+  try {
+    const d = await getMsa(og, drawerSignal);
+    if (!drawerGen.isCurrent(my) || og !== currentOg) return;
+    msaView.setData(d);
+    drawerLoaded.msa = og;
+    msaStatus.textContent = `${d.rows.length} rows × ${d.length} cols`;
+    msaBadges.innerHTML =
+      `<span class="badge src">${esc(d.source)}</span>` + (d.trimmed === true ? ' <span class="badge">trimmed</span>' : '');
+  } catch (err) {
+    if (!drawerGen.isCurrent(my) || og !== currentOg) return;
+    msaView.setData(null);
+    msaStatus.textContent = (err as Error).message;
+    if (err instanceof HttpError && err.status === 503) msaRetry.hidden = false;
+  }
+}
+
+async function renderGeneTree(og: string): Promise<void> {
+  const my = drawerGen.current;
+  const spec = metaFields.find((f) => f.name === treeField);
+  if (treeState.get(og) === 'missing') {
+    geneTreeView.setData(null, genomes, spec);
+    treeStatus.textContent = treeError.get(og) ?? 'no gene tree for this orthogroup';
+    drawerLoaded.tree = og;
+    return;
+  }
+  treeStatus.textContent = 'loading…';
+  try {
+    const d = treeData.get(og) ?? (await fetchTreeData(og));
+    if (!drawerGen.isCurrent(my) || og !== currentOg) return;
+    geneTreeView.setData(d, genomes, spec);
+    treeStatus.textContent = `${d.parent.length} nodes`;
+    drawerLoaded.tree = og;
+    updateNwkLink();
+  } catch (err) {
+    if (!drawerGen.isCurrent(my) || og !== currentOg) return;
+    geneTreeView.setData(null, genomes, spec);
+    treeStatus.textContent = (err as Error).message;
+    if (treeState.get(og) === 'missing') updateNwkLink();
+  }
+}
+
+function pct(x: number): string {
+  return `${Math.round(x * 100)}%`;
+}
+
+function onMsaHover(h: MsaHover | null, clientX: number, clientY: number): void {
+  if (!h) {
+    hideTooltip();
+    return;
+  }
+  if (h.bar) {
+    tooltip.innerHTML = `col ${h.col + 1} · conservation ${pct(h.conservation)} · gap ${pct(h.gap)}`;
+    tooltip.style.display = 'block';
+    placeTooltip(clientX, clientY);
+    return;
+  }
+  tooltip.innerHTML =
+    `<b>${esc(h.gene)}</b> · <span class="tip-dim">${esc(h.genome)}</span><br>` +
+    `col ${h.col + 1} · ${esc(h.residue)}${h.ungapped > 0 ? ` · ungapped ${h.ungapped}` : ''}<br>` +
+    `conservation ${pct(h.conservation)} · gap ${pct(h.gap)}`;
+  tooltip.style.display = 'block';
+  placeTooltip(clientX, clientY);
+}
+
+function onTreeHover(h: GeneTreeHover | null, clientX: number, clientY: number): void {
+  if (!h) {
+    hideTooltip();
+    return;
+  }
+  const gene = h.gene ?? 'internal node';
+  const support = h.support === null || h.support === undefined ? '' : ` · support ${h.support}`;
+  tooltip.innerHTML = `<b>${esc(gene)}</b>${h.genome ? ` · <span class="tip-dim">${esc(h.genome)}</span>` : ''}${h.duplication ? ' · <b>duplication</b>' : ''}${support}`;
+  tooltip.style.display = 'block';
+  placeTooltip(clientX, clientY);
+}
+
+function onLeafHover(genomeRow: number | null): void {
+  highlightRow = genomeRow;
+  renderOverlayNow();
+}
+
+function onHashChange(): void {
+  const p = new URLSearchParams(location.hash.slice(1));
+  const og = p.get('og');
+  const tab = p.get('tab');
+  if (og && (tab === 'members' || tab === 'msa' || tab === 'gene-tree')) openDrawer(og, tab);
+  else if (!og && panel.classList.contains('visible')) closeDrawer();
+}
+
+function closeDrawer(): void {
+  beginDrawer();
+  panel.classList.remove('visible');
+  currentOg = null;
+  drawerLoaded.members = drawerLoaded.msa = drawerLoaded.tree = null;
+  clearDrawerPanes();
+  scheduleHash();
 }
 
 async function loadPattern(og: string, my: number): Promise<void> {
   const host = document.getElementById('pattern-section');
   if (!host) return;
   try {
-    const pat = await getPattern(og);
-    if (my !== detailSeq) return;
-    const items = pat.orthogroups
+    const pat = await getPattern(og, 200, drawerSignal);
+    if (!drawerGen.isCurrent(my) || og !== currentOg) return;
+    const others = pat.orthogroups.filter((p) => p.orthogroup !== og);
+    const items = others
       .slice(0, 200)
       .map((p) => {
         const desc = Object.entries(p.annotations ?? {})
@@ -927,10 +1333,9 @@ async function loadPattern(og: string, my: number): Promise<void> {
         return `<li><span class="linkish" data-og="${esc(p.orthogroup)}">${esc(p.orthogroup)}</span>${desc ? ` — ${desc}` : ''}</li>`;
       })
       .join('');
-    host.innerHTML = `
-      <h2>same pattern (${pat.total})</h2>
-      <button id="order-pattern">Order by pattern</button>
-      <ul>${items}</ul>`;
+    host.innerHTML = others.length
+      ? `<h2>same pattern (${others.length})</h2><button id="order-pattern">Order by pattern</button><ul>${items}</ul>`
+      : `<h2>same pattern</h2><p class="muted">no other orthogroup has this pattern</p><button id="order-pattern">Order by pattern</button>`;
     host.querySelectorAll('.linkish').forEach((el) => {
       el.addEventListener('click', () => void jumpToOg((el as HTMLElement).dataset.og!));
     });
@@ -947,11 +1352,6 @@ async function orderByPattern(og: string): Promise<void> {
   } catch (err) {
     notice(`pattern order failed: ${(err as Error).message}`);
   }
-}
-
-function closePanel(): void {
-  detailSeq++;
-  panel.classList.remove('visible');
 }
 
 function updateSortButton(): void {
@@ -985,9 +1385,11 @@ function scheduleHash(): void {
 
 function updateHash(): void {
   const q = searchBox?.query ?? '';
+  const drawer = currentOg ? `&og=${encodeURIComponent(currentOg)}&tab=${currentTab}` : '';
   const h =
     `order=${encodeURIComponent(order)}&cx=${view.cx.toFixed(2)}&cy=${view.cy.toFixed(2)}` +
     `&zx=${view.zx.toFixed(3)}&zy=${view.zy.toFixed(3)}&mode=${mode}` +
+    drawer +
     (q ? `&q=${encodeURIComponent(q)}` : '');
   history.replaceState(null, '', `#${h}`);
 }
@@ -1016,6 +1418,9 @@ function applyHash(): void {
   orderSelect.value = order;
   const q = p.get('q');
   if (q) searchBox.setQuery(q);
+  const og = p.get('og');
+  const tab = p.get('tab');
+  if (og && (tab === 'members' || tab === 'msa' || tab === 'gene-tree')) openDrawer(og, tab);
 }
 
 boot().catch((err) => {

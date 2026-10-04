@@ -521,6 +521,116 @@ function patternResponse(ogIdx: number): Response {
   });
 }
 
+// --- v2: MSA / gene tree / downloads ---------------------------------------
+
+const AMINO = 'ACDEFGHIKLMNPQRSTVWY';
+const msaBusyAt = new Map<number, number>();
+
+interface GeneRef {
+  genome: string;
+  row: number;
+  gene: string;
+  raw: string;
+}
+
+function genesOf(ogIdx: number): GeneRef[] {
+  const out: GeneRef[] = [];
+  for (let r = 0; r < N_G; r++) {
+    if (!presence[r * N_OG + ogIdx]) continue;
+    const c = copies[r * N_OG + ogIdx];
+    for (let k = 0; k < c; k++) {
+      const raw = `gnl|extdb|${genomeNames[r]}_${String(ogIdx).padStart(6, '0')}_${k + 1}`;
+      out.push({genome: genomeNames[r], row: r, gene: raw.replace(/^gnl\|[^|]+\|/, ''), raw});
+    }
+  }
+  out.sort((a, b) => a.row - b.row || (a.gene < b.gene ? -1 : 1));
+  return out;
+}
+
+const hasMsa = (og: number) => og % 97 !== 42; // some OGs have no alignment
+const msaSource = (og: number): 'orthofinder' | 'famsa' => (og % 11 === 3 ? 'famsa' : 'orthofinder');
+
+function makeMsa(ogIdx: number) {
+  const genes = genesOf(ogIdx);
+  const length = 24 + (ogIdx % 40);
+  const rows = genes.map((g, gi) => {
+    let seq = '';
+    for (let c = 0; c < length; c++) {
+      const base = AMINO[(c * 7 + genomeClade[g.row] * 3) % AMINO.length];
+      const m = (c * 13 + gi * 5) % 23;
+      seq += m === 0 ? AMINO[(c * 3 + gi) % AMINO.length] : m === 1 ? '-' : base;
+    }
+    return {genome: g.genome, row: g.row, gene: g.gene, raw: g.raw, seq};
+  });
+  return {orthogroup: `OG${String(ogIdx).padStart(7, '0')}`, source: msaSource(ogIdx), length, trimmed: ogIdx % 3 === 0 ? true : ogIdx % 3 === 1 ? false : null, rows};
+}
+
+const hasTree = (og: number) => genesOf(og).length >= 4 && og % 101 !== 42;
+
+function makeGeneTree(ogIdx: number) {
+  const genes = genesOf(ogIdx);
+  const parent: number[] = [];
+  const length: number[] = [];
+  const label: string[] = [];
+  const gene: (string | null)[] = [];
+  const genomeRow: number[] = [];
+  const duplication: boolean[] = [];
+  const support: (number | null)[] = [];
+  let id = 0;
+  const build = (lo: number, hi: number, par: number): void => {
+    const my = id++;
+    parent[my] = par;
+    length[my] = 0.05 + ((my * 7) % 10) / 100;
+    support[my] = par < 0 ? null : Number((0.5 + (my % 5) / 10).toFixed(2));
+    if (hi - lo === 1) {
+      const g = genes[lo];
+      label[my] = g.gene;
+      gene[my] = g.gene;
+      genomeRow[my] = g.row;
+      duplication[my] = false;
+    } else {
+      label[my] = `n${my}`;
+      gene[my] = null;
+      genomeRow[my] = -1;
+      duplication[my] = my % 3 === 0;
+      const mid = Math.floor((lo + hi) / 2);
+      build(lo, mid, my);
+      build(mid, hi, my);
+    }
+  };
+  build(0, genes.length, -1);
+  return {orthogroup: `OG${String(ogIdx).padStart(7, '0')}`, parent, length, label, gene, genome_row: genomeRow, duplication, support};
+}
+
+function newickOf(tree: ReturnType<typeof makeGeneTree>, ids: 'display' | 'raw', ogIdx: number): string {
+  const children: number[][] = tree.parent.map(() => []);
+  tree.parent.forEach((p, i) => {
+    if (p >= 0) children[p].push(i);
+  });
+  const genes = new Map(genesOf(ogIdx).map((g) => [g.gene, g]));
+  const name = (i: number) => {
+    const leafGene = tree.gene[i];
+    if (leafGene) return (ids === 'raw' ? genes.get(leafGene)?.raw : leafGene) ?? leafGene;
+    return tree.label[i];
+  };
+  const rec = (i: number): string => {
+    const kids = children[i];
+    const bl = tree.length[i] ? `:${tree.length[i].toFixed(4)}` : '';
+    if (!kids.length) return `${name(i)}${bl}`;
+    return `(${kids.map(rec).join(',')})${name(i)}${bl}`;
+  };
+  return rec(0) + ';';
+}
+
+function download(content: string, filename: string): Response {
+  return new Response(content, {
+    headers: {
+      'content-type': 'text/plain; charset=utf-8',
+      'content-disposition': `attachment; filename="${filename}"`,
+    },
+  });
+}
+
 // --- routing ----------------------------------------------------------------
 const server = Bun.serve({
   port: PORT,
@@ -540,7 +650,7 @@ const server = Bun.serve({
         tracks: Object.keys(trackData).map(trackInfo),
         annotations: metaAnnotations,
         genome_metadata: metaGenomeMetadata,
-        detail: {},
+        detail: {msa: true, gene_trees: true, sequences: true, famsa: true},
       });
     }
     if (p === '/api/genomes') {
@@ -641,12 +751,42 @@ const server = Bun.serve({
     }
     if (p.startsWith('/api/orthogroup/')) {
       const rest = p.slice('/api/orthogroup/'.length);
-      const isPattern = rest.endsWith('/pattern');
-      const id = decodeURIComponent(isPattern ? rest.slice(0, -'/pattern'.length) : rest);
+      const suffix = ['/pattern', '/msa', '/gene-tree.nwk', '/gene-tree', '/fasta'].find((s) => rest.endsWith(s));
+      const id = decodeURIComponent(suffix ? rest.slice(0, -suffix.length) : rest);
       const m = /^OG(\d+)$/.exec(id);
       if (!m || Number(m[1]) >= N_OG) return bad(404, `unknown orthogroup: ${id}`);
       const ogIdx = Number(m[1]);
-      return isPattern ? patternResponse(ogIdx) : orthogroupDetails(ogIdx);
+      const ids: 'display' | 'raw' = q.get('ids') === 'raw' ? 'raw' : 'display';
+      if (suffix === '/msa') {
+        if (!hasMsa(ogIdx)) return bad(404, 'no MSA for this orthogroup (no sequences available)');
+        if (ogIdx === 1500 && (msaBusyAt.get(ogIdx) ?? 0) < Date.now() - 3000) {
+          msaBusyAt.set(ogIdx, Date.now());
+          return bad(503, 'alignment limit busy, try again');
+        }
+        if (msaSource(ogIdx) === 'famsa') await Bun.sleep(250);
+        return json(makeMsa(ogIdx));
+      }
+      if (suffix === '/gene-tree') {
+        if (!hasTree(ogIdx)) return bad(404, 'no gene tree for this orthogroup (<4 genes)');
+        return json(makeGeneTree(ogIdx));
+      }
+      if (suffix === '/gene-tree.nwk') {
+        if (!hasTree(ogIdx)) return bad(404, 'no gene tree for this orthogroup (<4 genes)');
+        return download(newickOf(makeGeneTree(ogIdx), ids, ogIdx), `OG${String(ogIdx).padStart(7, '0')}.nwk`);
+      }
+      if (suffix === '/fasta') {
+        const aligned = q.get('aligned') === '1';
+        if (aligned && !hasMsa(ogIdx)) return bad(404, 'no MSA for this orthogroup');
+        const rows = aligned
+          ? makeMsa(ogIdx).rows
+          : genesOf(ogIdx).map((g) => ({...g, seq: ''}));
+        const body = rows
+          .map((r) => `>${ids === 'raw' ? (r as GeneRef).raw : (r as GeneRef).gene}\n${aligned ? (r as {seq: string}).seq : 'MKT'}`)
+          .join('\n');
+        const name = `OG${String(ogIdx).padStart(7, '0')}${aligned ? '.aligned' : ''}.fa`;
+        return download(body + '\n', name);
+      }
+      return suffix === '/pattern' ? patternResponse(ogIdx) : orthogroupDetails(ogIdx);
     }
     if (p === '/api/orders' && req.method === 'POST') {
       const length = req.headers.get('content-length');

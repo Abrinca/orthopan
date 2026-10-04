@@ -267,3 +267,66 @@ export async function postOrder(body: {
   if (!res.ok) throw new HttpError(res.status, `/api/orders: HTTP ${res.status}`);
   return (await res.json()) as {order: string};
 }
+
+// --- v2: single-orthogroup detail view -------------------------------------
+
+export interface MsaRow {
+  genome: string;
+  row: number;
+  gene: string;
+  raw: string;
+  seq: string;
+}
+
+export interface MsaResult {
+  orthogroup: string;
+  source: 'orthofinder' | 'famsa';
+  length: number;
+  trimmed: boolean | null;
+  rows: MsaRow[];
+}
+
+export interface GeneTreeArrays {
+  orthogroup: string;
+  parent: number[];
+  length: number[];
+  label: string[];
+  gene: (string | null)[];
+  genome_row: number[];
+  duplication: boolean[];
+  support: (number | null)[];
+}
+
+export type IdMode = 'display' | 'raw';
+
+/** Read a JSON error body and surface its `detail` as the error message. */
+async function getJSONDetail<T>(path: string, signal?: AbortSignal): Promise<T> {
+  const res = await fetch(BASE + path, {signal});
+  if (!res.ok) {
+    let detail = `${path}: HTTP ${res.status}`;
+    try {
+      const body = (await res.json()) as {detail?: unknown};
+      if (body && body.detail !== undefined) detail = String(body.detail);
+    } catch {
+      /* not JSON */
+    }
+    throw new HttpError(res.status, detail);
+  }
+  return (await res.json()) as T;
+}
+
+export function getMsa(og: string, signal?: AbortSignal): Promise<MsaResult> {
+  return getJSONDetail<MsaResult>(`/api/orthogroup/${encodeURIComponent(og)}/msa`, signal);
+}
+
+export function getGeneTree(og: string, signal?: AbortSignal): Promise<GeneTreeArrays> {
+  return getJSONDetail<GeneTreeArrays>(`/api/orthogroup/${encodeURIComponent(og)}/gene-tree`, signal);
+}
+
+export function fastaUrl(og: string, aligned: boolean, ids: IdMode): string {
+  return `/api/orthogroup/${encodeURIComponent(og)}/fasta?aligned=${aligned ? 1 : 0}&ids=${ids}`;
+}
+
+export function geneTreeNwkUrl(og: string, ids: IdMode): string {
+  return `/api/orthogroup/${encodeURIComponent(og)}/gene-tree.nwk?ids=${ids}`;
+}
