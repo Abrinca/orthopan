@@ -62,3 +62,25 @@ def test_empty_input_raises(tmp_path):
 def test_single_id_no_columns_raises(tmp_path):
     with pytest.raises(ValueError, match="no genome columns"):
         read_matrix(_write(tmp_path, "z.tsv", "OG1\nOG2\n"))
+
+
+def test_close_before_iterating_closes_file(tmp_path):
+    _, rows = read_matrix(_write(tmp_path, "c.tsv", "Orthogroup\tA\tB\nOG1\tg1\tg2\n"))
+    assert not rows._fh.closed
+    rows.close()
+    assert rows._fh.closed
+
+
+def test_iterating_to_exhaustion_closes_file(tmp_path):
+    _, rows = read_matrix(_write(tmp_path, "e.tsv", "Orthogroup\tA\tB\nOG1\tg1\tg2\n"))
+    assert list(rows) == [("OG1", ["g1", "g2"])]
+    assert rows._fh.closed
+
+
+def test_with_closes_file_when_body_raises(tmp_path):
+    _, rows = read_matrix(_write(tmp_path, "w.tsv", "Orthogroup\tA\tB\nOG1\tg1\tg2\n"))
+    with pytest.raises(RuntimeError):
+        with rows:
+            assert not rows._fh.closed
+            raise RuntimeError("boom")
+    assert rows._fh.closed

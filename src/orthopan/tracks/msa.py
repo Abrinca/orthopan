@@ -54,7 +54,6 @@ so the whole dataset is never held in memory; in pooled mode without a
 """
 
 import argparse
-import multiprocessing as mp
 import os
 import sys
 import time
@@ -351,10 +350,10 @@ def main(argv=None):
     n_fallback = 0
 
     if args.threads and args.threads > 1 and (msa_ogs or args.orthogroups):
-        # fork inherits the module state; batches bound in-flight membership memory.
-        ctx = mp.get_context("fork") if "fork" in mp.get_all_start_methods() else None
+        # Platform default start method (forkserver/spawn): fork after native threads
+        # can deadlock. _init passes config explicitly; batches bound in-flight memory.
         with ProcessPoolExecutor(
-            max_workers=args.threads, mp_context=ctx, initializer=_init, initargs=(cfg,)
+            max_workers=args.threads, initializer=_init, initargs=(cfg,)
         ) as ex:
             pending, processed, batch = [], set(), []
             limit, chunk = 2 * args.threads, 32

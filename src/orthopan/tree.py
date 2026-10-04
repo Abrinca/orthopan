@@ -13,7 +13,8 @@ _SPECIAL = set("(),:;'[]")
 
 def _matrix(path):
     """Return (genome labels, presence matrix with genomes as rows)."""
-    magic = open(path, "rb").read(2) == b"\x1f\x8b"
+    with open(path, "rb") as fh:
+        magic = fh.read(2) == b"\x1f\x8b"
     labels, n, buf = [], None, bytearray()
     with (gzip.open if magic else open)(path, "rb") as fh:
         for line_no, raw in enumerate(fh, 1):

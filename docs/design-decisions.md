@@ -29,6 +29,11 @@ Decisions taken so far (2026-10-04). See `VISION.md` for context and `docs/anvio
   - A bit-packed presence matrix.
 - When many cells share one pixel, show the fraction present.
 - Cells encode presence by default. Copy number is an optional color mode.
+- Backend: FastAPI. It also serves the built frontend.
+- Frontend: Vite + TypeScript + deck.gl, without React.
+- Matrix windows travel as raw binary arrays. The client applies colors. Revisit this if something better turns up.
+- Zoomed-out aggregates are computed on the fly with a numpy block mean over `presence.npy`. Add caching or an import-time pyramid only if 10k genomes turn out too slow.
+- The API contract is in `docs/api.md`.
 - The first build step is `orthopan import`: TSV plus optional tree in, Parquet directory with orderings out.
 
 ## Per-orthogroup tracks

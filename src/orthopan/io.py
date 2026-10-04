@@ -12,6 +12,54 @@ def open_text(path):
     return gzip.open(path, "rt") if gz else open(path)
 
 
+class _MatrixRows:
+    """Iterator over matrix body rows that owns the input file.
+
+    Iterating to exhaustion closes the file; ``with``/``close()`` close it
+    deterministically when the caller stops early (for example after raising).
+    """
+
+    def __init__(self, fh, rows, n):
+        self._fh = fh
+        self._rows = rows
+        self._n = n
+        self._gen = self._generate()
+
+    def _generate(self):
+        try:
+            for line_no, line in self._rows:
+                og, *cells = line.split("\t")
+                if len(cells) > self._n:
+                    raise ValueError(
+                        f"line {line_no}: {len(cells)} genome columns, expected {self._n}"
+                    )
+                yield og, cells + [""] * (self._n - len(cells))
+        finally:
+            self._fh.close()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self._gen)
+
+    def close(self):
+        self._fh.close()
+        self._gen.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
 def read_matrix(path) -> tuple[list[str], Iterator[tuple[str, list[str]]]]:
     """Read a Format B (per-genome matrix) TSV.
 
@@ -36,15 +84,7 @@ def read_matrix(path) -> tuple[list[str], Iterator[tuple[str, list[str]]]]:
         fh.close()
         raise ValueError("input has no genome columns")
 
-    def gen():
-        with fh:
-            for line_no, line in rows:
-                og, *cells = line.split("\t")
-                if len(cells) > n:
-                    raise ValueError(f"line {line_no}: {len(cells)} genome columns, expected {n}")
-                yield og, cells + [""] * (n - len(cells))
-
-    return labels, gen()
+    return labels, _MatrixRows(fh, rows, n)
 
 
 def split_genes(cell: str) -> list[str]:
