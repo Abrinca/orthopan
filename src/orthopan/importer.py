@@ -27,6 +27,7 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 
+from orthopan import sequences as seqmod
 from orthopan.io import (
     DEFAULT_GENE_PREFIX,
     compile_prefix,
@@ -564,6 +565,17 @@ def run(args) -> None:
         leaf_pre = {tree.label[i]: i for i in tree.leaf_order}
         genome_leafpos = [tree.leaf_pos[leaf_pre[name]] for name in labels]
 
+        # --- --fasta byte-offset index --------------------------------------
+        fasta_paths, fasta_index, stem_to_genome = [], {}, {}
+        if args.fasta:
+            fasta_paths = [
+                str(Path(p).resolve())
+                for p in seqmod.warn_gzip(list(seqmod.fasta_files(args.fasta)))
+            ]
+            fasta_index = seqmod.index_files(fasta_paths, pattern)
+            for label in labels:
+                stem_to_genome.setdefault(seqmod.stem(label), label)
+
         # --- tracks / annotations / metadata --------------------------------
         sources = _read_track_sources(args.track)
         if results_dir is not None:
@@ -589,6 +601,8 @@ def run(args) -> None:
         mem_og, mem_genome, mem_copies, mem_genes, mem_genes_raw = [], [], [], [], []
         mc_row, mc_og, mc_extra = [], [], []
         parts = []
+        seq_rows = {}
+        fasta_total = 0
 
         def flush_membership():
             if not mem_og:
@@ -643,6 +657,19 @@ def run(args) -> None:
                 if not raw_genes:
                     continue
                 genes = tuple(strip_gene_prefix(g, pattern) for g in raw_genes)
+                if fasta_index:
+                    genome_name = labels[genome_idx]
+                    fasta_total += len(raw_genes)
+                    for raw, display in zip(raw_genes, genes):
+                        key = (raw, genome_name)
+                        if key in seq_rows:
+                            continue
+                        record = seqmod.resolve(
+                            fasta_index, raw, display, genome_name, fasta_paths,
+                            stem_to_genome,
+                        )
+                        if record is not None:
+                            seq_rows[key] = record
                 copies = len(raw_genes)
                 present += 1
                 total += copies
@@ -689,6 +716,30 @@ def run(args) -> None:
 
         flush_membership()
         n_og = len(og_ids)
+
+        # --- sequences.parquet (byte-offset index of membership genes) -------
+        sequences_path = outdir / "sequences.parquet"
+        if args.fasta:
+            if seq_rows:
+                rows_out = [
+                    {
+                        "gene": raw, "genome": genome_name,
+                        "file": record[0], "offset": record[1], "length": record[2],
+                    }
+                    for (raw, genome_name), record in seq_rows.items()
+                ]
+                pl.DataFrame(rows_out, schema={
+                    "gene": pl.Utf8, "genome": pl.Utf8,
+                    "file": pl.UInt32, "offset": pl.Int64, "length": pl.UInt32,
+                }).write_parquet(sequences_path)
+            elif sequences_path.exists():
+                sequences_path.unlink()
+            unresolved = fasta_total - len(seq_rows)
+            if unresolved:
+                print(
+                    f"warning: {unresolved} gene(s) from the membership not found in --fasta",
+                    file=sys.stderr,
+                )
 
         # Specs come from recognised IDs only; unknown IDs still warn below.
         annotation_specs, annotation_values = _annotation_specs(args.annotation, matrix_ogs)
@@ -873,6 +924,7 @@ def run(args) -> None:
         "tree_source": tree_source,
         "tracks": [str(t) for t in args.track],
         "track_columns": track_columns,
+        "fasta": fasta_paths,
         "annotations": annotation_specs,
         "genome_metadata": gm_specs,
         "detail": _orthofinder_detail(results_dir) if results_dir is not None else {},
@@ -898,6 +950,9 @@ def add_parser(subparsers):
                    help="per-orthogroup annotation file (repeatable)")
     p.add_argument("--genome-metadata", metavar="TSV",
                    help="per-genome metadata TSV (header; first column genome name)")
+    p.add_argument("--fasta", nargs="+", default=[], metavar="PATH",
+                   help="protein FASTA files or directories, indexed by byte offset "
+                        "(one flag with several paths; .gz is skipped)")
     p.add_argument("--strip-prefix", default=DEFAULT_GENE_PREFIX, metavar="REGEX",
                    help="gene-ID prefix to strip (default: ^gnl\\|[^|]+\\|; empty disables)")
     p.set_defaults(func=run)

@@ -13,9 +13,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import shutil
+import subprocess
+import tempfile
 import threading
 from collections import OrderedDict
 from pathlib import Path
+from urllib.parse import quote
 
 import numpy as np
 import polars as pl
@@ -24,7 +29,11 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
 
+from orthopan import sequences as seqmod
 from orthopan.importer import _parse_newick
+from orthopan.io import read_matrix
+from orthopan.tracks.msa import _expected_headers, _match_headers, read_fasta
+from orthopan.tree import _quote
 
 DEFAULT_TRACKS = ("copy_number_mean", "copy_number_max")
 MAX_CELLS = 4096
@@ -35,6 +44,88 @@ _LRU_SIZE = 24
 _ROW_CHUNK = 512
 # order ids minted by POST /api/orders
 _DYNAMIC_PREFIX = ("contrast:", "search:", "pattern:")
+_FAMSA_CONCURRENCY = 2
+_FAMSA_MAX_SEQS = 2000
+_FAMSA_TIMEOUT = 120
+
+
+def _famsa_ok(path: str) -> bool:
+    """True when the famsa binary resolves and aligns two tiny sequences."""
+    exe = shutil.which(path)
+    if exe is None:
+        return False
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            src, dst = Path(tmp) / "in.fa", Path(tmp) / "out.fa"
+            src.write_text(">a\nAAAA\n>b\nAAAT\n")
+            subprocess.run([exe, str(src), str(dst), "-t", "1"],
+                           check=True, capture_output=True, timeout=30)
+            pairs = _parse_fasta_text(dst.read_text())
+            return (len(pairs) == 2 and all(seq for _, seq in pairs)
+                    and len({len(seq) for _, seq in pairs}) == 1)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return False
+
+
+def _parse_fasta_text(text: str) -> list[tuple[str, str]]:
+    """Parse FASTA text into ``[(header, sequence), ...]``."""
+    out, name, buf = [], None, []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line[0] == ">":
+            if name is not None:
+                out.append((name, "".join(buf)))
+            name, buf = line[1:].strip(), []
+        else:
+            buf.append(line)
+    if name is not None:
+        out.append((name, "".join(buf)))
+    return out
+
+
+def _to_newick(root, name_of) -> str:
+    """Serialize a parsed Newick node tree, naming leaves via ``name_of``."""
+    out: list[str] = []
+    stack = [("node", root)]
+    while stack:
+        kind, obj = stack.pop()
+        if kind == "str":
+            out.append(obj)
+            continue
+        node = obj
+        if not node.children:
+            out.append(_quote(name_of(node)))
+            if node.branch is not None:
+                out.append(f":{node.branch:g}")
+            continue
+        out.append("(")
+        suffix = ")"
+        if node.label:
+            suffix += _quote(node.label)
+        if node.branch is not None:
+            suffix += f":{node.branch:g}"
+        stack.append(("str", suffix))
+        items = []
+        for i, child in enumerate(node.children):
+            if i:
+                items.append(("str", ","))
+            items.append(("node", child))
+        for item in reversed(items):
+            stack.append(item)
+    return "".join(out) + ";"
+
+
+def _content_disposition(filename: str) -> str:
+    """RFC 6266/5987 attachment header with an ASCII fallback and UTF-8 name."""
+    if any(ord(c) < 32 or ord(c) == 127 for c in filename):
+        raise HTTPException(status_code=400, detail="invalid filename")
+    fallback = filename.encode("ascii", "replace").decode("ascii")
+    fallback = fallback.replace("\\", "_").replace('"', "_")
+    return (f'attachment; filename="{fallback}"; '
+            f"filename*=UTF-8''{quote(filename, safe='')}")
+
 
 # Top-r-bit masks for masking a partial byte; MASKS[0] == 0.
 MASKS = np.array([((0xFF << (8 - r)) & 0xFF) for r in range(8)], np.uint8)
@@ -48,7 +139,7 @@ def _edges(n: int, k: int) -> np.ndarray:
 class Pangenome:
     """Everything the endpoints need, loaded once at app creation."""
 
-    def __init__(self, data_dir: str | Path):
+    def __init__(self, data_dir: str | Path, famsa: str = "famsa"):
         self.dir = Path(data_dir)
         manifest_path = self.dir / "manifest.json"
         if not manifest_path.is_file():
@@ -154,6 +245,35 @@ class Pangenome:
 
         self.detail = self.manifest.get("detail", {}) or {}
 
+        # --- v2: single-orthogroup detail sources ---------------------------
+        self.fasta_files = [str(p) for p in self.manifest.get("fasta", [])]
+        self._seq_lookup: dict[tuple[str, str], tuple[int, int, int]] = {}
+        seq_path = self.dir / "sequences.parquet"
+        if self.fasta_files and seq_path.is_file():
+            for r in pl.read_parquet(seq_path).iter_rows(named=True):
+                self._seq_lookup[(r["gene"], r["genome"])] = (
+                    int(r["file"]), int(r["offset"]), int(r["length"]))
+        self.msa_dir = Path(self.detail["msa"]) if self.detail.get("msa") else None
+        self.seq_dir = Path(self.detail["sequences"]) if self.detail.get("sequences") else None
+        self.gene_tree_file = (
+            Path(self.detail["gene_trees"]) if self.detail.get("gene_trees") else None)
+        if self.msa_dir is not None:
+            self.results_dir = self.msa_dir.parent
+        elif self.seq_dir is not None:
+            self.results_dir = self.seq_dir.parent
+        else:
+            self.results_dir = None
+        self._has_sequences = bool(self.seq_dir) or bool(self._seq_lookup)
+        self.famsa = famsa
+        self.famsa_ok = _famsa_ok(famsa)
+        self.cache_dir = self.dir / "cache" / "msa"
+        self._famsa_sem = threading.BoundedSemaphore(_FAMSA_CONCURRENCY)
+        self._famsa_locks: dict[str, threading.Lock] = {}
+        self._gt_index = None
+        self._gt_lock = threading.Lock()
+        self._dup_index = None
+        self._dup_lock = threading.Lock()
+
         self.tree = self._build_tree()
         self._packed("tree")  # prewarm the default view
 
@@ -178,6 +298,356 @@ class Pangenome:
                 row.append(leaf)
                 leaf += 1
         return {"parent": parent, "length": length, "label": label, "row": row}
+
+    # --- v2: single-orthogroup detail ---------------------------------------
+    def og_members(self, og_idx: int):
+        """Return ``[(genome_idx, genome, display_genes, raw_genes), ...]``."""
+        mem = (
+            pl.scan_parquet(self.dir / "membership.parquet")
+            .select(["og_idx", "genome_idx", "genes", "genes_raw"])
+            .filter(pl.col("og_idx") == og_idx)
+            .collect()
+            .sort("genome_idx")
+        )
+        out = []
+        for m in mem.iter_rows(named=True):
+            gi = int(m["genome_idx"])
+            out.append((gi, self.genome_names[gi], list(m["genes"]), list(m["genes_raw"])))
+        return out
+
+    def _member_context(self, og_idx: int):
+        members = self.og_members(og_idx)
+        member_map: dict[str, list[str]] = {}
+        raw_to_display: dict[str, str] = {}
+        for _, gname, genes, raws in members:
+            member_map[gname] = raws
+            for d, r in zip(genes, raws):
+                raw_to_display[r] = d
+        return members, member_map, raw_to_display, _expected_headers(member_map)
+
+    def _row_of(self, genome) -> int:
+        idx = self._name_to_idx.get(genome)
+        return int(self.row_order[idx]) if idx is not None else -1
+
+    def _trimmed_value(self, og_idx: int):
+        if "trimmed" not in self.orthogroups.columns:
+            return None
+        value = self.orthogroups["trimmed"].to_numpy()[og_idx]
+        return None if value is None or np.isnan(value) else bool(value)
+
+    def og_sequences(self, og_idx: int):
+        """Unaligned sequences for an OG as ``[(raw, display, genome, seq), ...]``."""
+        og = self.orthogroups["orthogroup"].to_numpy()[og_idx]
+        members, _, raw_to_display, _ = self._member_context(og_idx)
+        raw_genome = {
+            r: gname for _, gname, _, raws in members for r in raws
+        }
+        rows = []
+        path = (self.seq_dir / f"{og}.fa") if self.seq_dir else None
+        if path is not None and path.is_file():
+            for header, seq in read_fasta(path):
+                rows.append((header, raw_to_display.get(header, header),
+                             raw_genome.get(header), seq))
+        else:
+            for _, gname, genes, raws in members:
+                for display, raw in zip(genes, raws):
+                    record = self._seq_lookup.get((raw, gname))
+                    if record is None:
+                        continue
+                    _, seq = seqmod.read_record(self.fasta_files, record)
+                    rows.append((raw, display, gname, seq))
+        rows.sort(key=lambda t: (self._row_of(t[2]) if t[2] else 1 << 30, t[0]))
+        return rows
+
+    def _msa_text(self, og: str, og_idx: int):
+        """Return ``(fasta_text, source)``, generating with famsa if needed."""
+        if self.msa_dir is not None:
+            path = self.msa_dir / f"{og}.fa"
+            if path.is_file():
+                return path.read_text(), "orthofinder"
+        cache = self.cache_dir / f"{og}.fa"
+        if cache.is_file():
+            return cache.read_text(), "famsa"
+        seqs = self.og_sequences(og_idx)
+        if not seqs:
+            raise HTTPException(status_code=404, detail="no MSA and no sequences available")
+        if len(seqs) > _FAMSA_MAX_SEQS:
+            raise HTTPException(
+                status_code=404,
+                detail=f"no MSA; {len(seqs)} sequences exceed the {_FAMSA_MAX_SEQS} limit",
+            )
+        if not self.famsa_ok:
+            raise HTTPException(status_code=404, detail="no MSA and famsa is not available")
+        if not self._famsa_sem.acquire(blocking=False):
+            raise HTTPException(status_code=503, detail="alignment queue is busy")
+        try:
+            with self._famsa_lock(og):
+                if cache.is_file():  # another request finished while we waited
+                    return cache.read_text(), "famsa"
+                raw_text = self._run_famsa(og, seqs)
+                text = self._canonicalize_famsa(raw_text, seqs)
+                self._write_cache(og, text)
+                return text, "famsa"
+        finally:
+            self._famsa_sem.release()
+
+    def _famsa_lock(self, og: str) -> threading.Lock:
+        with self._lock:
+            lock = self._famsa_locks.get(og)
+            if lock is None:
+                lock = self._famsa_locks[og] = threading.Lock()
+            return lock
+
+    @staticmethod
+    def _famsa_headers(n: int) -> list[str]:
+        return [f"m{i}" for i in range(n)]
+
+    def _run_famsa(self, og: str, seqs) -> str:
+        # Monkeypatched in tests; returns raw famsa output (indexed m<i> headers).
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        fd_in, tmp_in = tempfile.mkstemp(suffix=".fa", dir=self.cache_dir)
+        fd_out, tmp_out = tempfile.mkstemp(suffix=".fa", dir=self.cache_dir)
+        os.close(fd_in)
+        os.close(fd_out)
+        try:
+            with open(tmp_in, "w") as fh:
+                for header, (_, _, _, seq) in zip(self._famsa_headers(len(seqs)), seqs):
+                    fh.write(f">{header}\n{seq}\n")
+            try:
+                subprocess.run(
+                    [self.famsa, tmp_in, tmp_out, "-t", "1"],
+                    check=True, capture_output=True, timeout=_FAMSA_TIMEOUT,
+                )
+            except subprocess.TimeoutExpired:
+                raise HTTPException(status_code=500, detail="famsa timed out") from None
+            except subprocess.CalledProcessError as exc:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"famsa failed: {exc.stderr.decode(errors='replace')[:200]}",
+                ) from None
+            return Path(tmp_out).read_text()
+        finally:
+            for path in (tmp_in, tmp_out):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+
+    def _canonicalize_famsa(self, text: str, seqs) -> str:
+        """Map famsa's indexed headers back to membership IDs; validate output.
+
+        Rejects incomplete/wrong-identity output, empty records and unequal
+        alignment lengths, so bad output is never cached.
+        """
+        pairs = _parse_fasta_text(text)
+        mapping = {f"m{i}": (raw, genome)
+                   for i, (raw, _, genome, _) in enumerate(seqs)}
+        if sorted(h for h, _ in pairs) != sorted(mapping):  # exact permutation
+            raise HTTPException(
+                status_code=500, detail="famsa produced an incomplete alignment")
+        lengths, out = set(), []
+        for header, seq in pairs:
+            if header not in mapping or not seq:
+                raise HTTPException(
+                    status_code=500, detail="famsa produced an invalid alignment")
+            lengths.add(len(seq))
+            raw, genome = mapping[header]
+            canonical = f"{genome.replace('.', '_')}_{raw}" if genome else raw
+            out.append(f">{canonical}\n{seq}\n")
+        if len(lengths) != 1:
+            raise HTTPException(
+                status_code=500, detail="famsa produced an invalid alignment")
+        return "".join(out)
+
+    def _write_cache(self, og: str, text: str) -> None:
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(suffix=".fa.tmp", dir=self.cache_dir)
+        os.close(fd)
+        try:
+            Path(tmp).write_text(text)
+            os.replace(tmp, self.cache_dir / f"{og}.fa")  # unique temp -> atomic
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+    def og_msa(self, og: str) -> dict:
+        og_idx = self._og_to_idx.get(og)
+        if og_idx is None:
+            raise HTTPException(status_code=404, detail=f"unknown orthogroup: {og!r}")
+        text, source = self._msa_text(og, og_idx)
+        _, _, raw_to_display, expected = self._member_context(og_idx)
+        pairs = _parse_fasta_text(text)
+        matched, _, _ = _match_headers([h for h, _ in pairs], expected)
+        rows = []
+        for header, seq in pairs:
+            match = matched.get(header)
+            if match:
+                genome, raw = match
+                display = raw_to_display.get(raw, raw)
+            else:
+                genome, raw, display = None, header, header
+            rows.append({
+                "genome": genome, "row": self._row_of(genome),
+                "gene": display, "raw": raw, "seq": seq,
+            })
+        rows.sort(key=lambda r: (r["row"] if r["row"] >= 0 else 1 << 30, r["gene"]))
+        return {
+            "orthogroup": og,
+            "source": source,
+            "length": len(rows[0]["seq"]) if rows else 0,
+            "trimmed": self._trimmed_value(og_idx),
+            "rows": rows,
+        }
+
+    def _gene_tree_index(self) -> dict:
+        if self._gt_index is not None:
+            return self._gt_index
+        with self._gt_lock:
+            if self._gt_index is None:
+                index = {}
+                offset = 0
+                with open(self.gene_tree_file, "rb") as fh:
+                    for line in fh:
+                        if b":" in line:
+                            og = line.split(b":", 1)[0].strip().decode()
+                            index[og] = (offset, len(line))
+                        offset += len(line)
+                self._gt_index = index
+        return self._gt_index
+
+    def _gene_tree_raw(self, og: str):
+        if self.gene_tree_file is None or not self.gene_tree_file.is_file():
+            return None
+        record = self._gene_tree_index().get(og)
+        if record is None:
+            return None
+        with open(self.gene_tree_file, "rb") as fh:
+            fh.seek(record[0])
+            line = fh.read(record[1]).decode()
+        _, sep, newick = line.strip().partition(":")
+        return newick.strip() if sep else None
+
+    def _duplications(self, og: str) -> dict:
+        if self._dup_index is None:
+            with self._dup_lock:
+                if self._dup_index is None:
+                    index: dict[str, dict[str, float]] = {}
+                    path = (self.results_dir / "Gene_Duplication_Events" / "Duplications.tsv"
+                            if self.results_dir else None)
+                    if path is not None and path.is_file():
+                        labels, rows = read_matrix(path)
+                        node_col = labels.index("Gene Tree Node") if "Gene Tree Node" in labels else None
+                        support_col = labels.index("Support") if "Support" in labels else None
+                        if node_col is not None:
+                            for og_id, cells in rows:
+                                node = cells[node_col]
+                                if not node:
+                                    continue
+                                support = None
+                                if support_col is not None and support_col < len(cells):
+                                    try:
+                                        support = float(cells[support_col])
+                                    except ValueError:
+                                        support = None
+                                index.setdefault(og_id, {}).setdefault(node, support)
+                    self._dup_index = index
+        return self._dup_index.get(og, {})
+
+    def og_gene_tree(self, og: str) -> dict:
+        og_idx = self._og_to_idx.get(og)
+        if og_idx is None:
+            raise HTTPException(status_code=404, detail=f"unknown orthogroup: {og!r}")
+        raw = self._gene_tree_raw(og)
+        if raw is None:
+            raise HTTPException(
+                status_code=404,
+                detail="no gene tree for this orthogroup (OrthoFinder builds trees "
+                       "only for orthogroups with at least 4 genes)",
+            )
+        root = _parse_newick(raw)
+        _, _, raw_to_display, expected = self._member_context(og_idx)
+        dup = self._duplications(og)
+        return self._gene_tree_arrays(og, root, expected, raw_to_display, dup)
+
+    def _gene_tree_arrays(self, og, root, expected, raw_to_display, dup) -> dict:
+        parent, length, label, gene, genome_row, duplication, support = (
+            [], [], [], [], [], [], [])
+        stack = [(root, -1, 0.0)]
+        while stack:
+            node, par, branch = stack.pop()
+            i = len(parent)
+            parent.append(par)
+            length.append(branch)
+            lab = node.label or ""
+            label.append(lab)
+            # A node is a duplication iff the Duplications table names it; a
+            # missing Support value leaves the flag true but support null.
+            duplication.append(lab in dup)
+            value = dup.get(lab)
+            support.append(float(value) if value is not None else None)
+            if node.children:
+                gene.append(None)
+                genome_row.append(-1)
+                for child in reversed(node.children):
+                    stack.append((
+                        child, i,
+                        float(child.branch) if child.branch is not None else 0.0))
+            else:
+                cands = expected.get(lab)
+                if cands and len(cands) == 1:
+                    gname, raw = next(iter(cands))
+                    gene.append(raw_to_display.get(raw, raw))
+                    genome_row.append(self._row_of(gname))
+                else:
+                    gene.append(None)
+                    genome_row.append(-1)
+        return {
+            "orthogroup": og, "parent": parent, "length": length, "label": label,
+            "gene": gene, "genome_row": genome_row,
+            "duplication": duplication, "support": support,
+        }
+
+    def _download_name(self, node, expected, raw_to_display, ids) -> str:
+        lab = node.label or ""
+        cands = expected.get(lab)
+        if cands and len(cands) == 1:
+            _, raw = next(iter(cands))
+            return raw if ids == "raw" else raw_to_display.get(raw, raw)
+        return lab
+
+    def download_fasta(self, og: str, aligned: bool, ids: str) -> tuple[str, str]:
+        og_idx = self._og_to_idx.get(og)
+        if og_idx is None:
+            raise HTTPException(status_code=404, detail=f"unknown orthogroup: {og!r}")
+        if aligned:
+            data = self.og_msa(og)
+            body = "".join(
+                f">{r['raw'] if ids == 'raw' else r['gene']}\n{r['seq']}\n"
+                for r in data["rows"]
+            )
+            return body, f"{og}.aligned.fa"
+        seqs = self.og_sequences(og_idx)
+        if not seqs:
+            raise HTTPException(status_code=404, detail="no sequences available")
+        body = "".join(
+            f">{raw if ids == 'raw' else display}\n{seq}\n"
+            for raw, display, _, seq in seqs
+        )
+        return body, f"{og}.fa"
+
+    def download_newick(self, og: str, ids: str) -> tuple[str, str]:
+        og_idx = self._og_to_idx.get(og)
+        if og_idx is None:
+            raise HTTPException(status_code=404, detail=f"unknown orthogroup: {og!r}")
+        raw = self._gene_tree_raw(og)
+        if raw is None:
+            raise HTTPException(status_code=404, detail="no gene tree for this orthogroup")
+        root = _parse_newick(raw)
+        _, _, raw_to_display, expected = self._member_context(og_idx)
+        name = lambda node: self._download_name(node, expected, raw_to_display, ids)
+        return _to_newick(root, name), f"{og}.nwk"
 
     # --- orders -------------------------------------------------------------
     def order_perm(self, order: str) -> np.ndarray:
@@ -349,11 +819,8 @@ class Pangenome:
     def _field_mask(frame, name, q) -> np.ndarray:
         """Case-insensitive literal substring mask for one column.
 
-        NB: this polars build (Python 3.15) silently returns ``None`` from
-        ``Series.str.*`` / ``fill_null`` / ``is_null`` / ``list.len`` because of
-        a broken bytecode check in polars' ``expr_dispatch``; only DataFrame
-        *expressions* work. Nulls are filled to ``False`` before the numpy
-        conversion, so an all-null annotation column masks to all-``False``.
+        Nulls are filled to ``False`` before the numpy conversion, so an
+        all-null annotation column masks to all-``False``.
         """
         return frame.select(
             pl.col(name).str.to_lowercase().str.contains(q, literal=True).fill_null(False)
@@ -459,7 +926,10 @@ class Pangenome:
             "annotations": self.annotation_specs,
             "genome_metadata": self.gm_specs,
             "detail": {
-                key: bool(self.detail.get(key)) for key in ("msa", "gene_trees", "sequences")
+                "msa": bool(self.detail.get("msa")),
+                "gene_trees": bool(self.detail.get("gene_trees")),
+                "sequences": self._has_sequences,
+                "famsa": self.famsa_ok,
             },
         }
 
@@ -489,8 +959,8 @@ def _annotation_values(pg, og_idx: int) -> dict:
             for name in pg.annotation_names}
 
 
-def create_app(data_dir, static_dir=None) -> FastAPI:
-    pg = Pangenome(data_dir)
+def create_app(data_dir, static_dir=None, famsa="famsa") -> FastAPI:
+    pg = Pangenome(data_dir, famsa=famsa)
     app = FastAPI(title="OrthoPan", docs_url=None, redoc_url=None)
     app.state.pg = pg
 
@@ -681,6 +1151,38 @@ def create_app(data_dir, static_dir=None) -> FastAPI:
             "orthogroups": orthogroups_out,
         }
 
+    @app.get("/api/orthogroup/{og}/msa")
+    def orthogroup_msa(og: str):
+        return pg.og_msa(og)
+
+    @app.get("/api/orthogroup/{og}/gene-tree")
+    def orthogroup_gene_tree(og: str):
+        return pg.og_gene_tree(og)
+
+    @app.get("/api/orthogroup/{og}/fasta")
+    def orthogroup_fasta(og: str, aligned: int = 0, ids: str = "display"):
+        if aligned not in (0, 1):
+            raise HTTPException(status_code=400, detail="aligned must be 0 or 1")
+        if ids not in ("display", "raw"):
+            raise HTTPException(status_code=400, detail="ids must be display or raw")
+        body, filename = pg.download_fasta(og, bool(aligned), ids)
+        return Response(
+            content=body,
+            media_type="text/plain",
+            headers={"Content-Disposition": _content_disposition(filename)},
+        )
+
+    @app.get("/api/orthogroup/{og}/gene-tree.nwk")
+    def orthogroup_newick(og: str, ids: str = "display"):
+        if ids not in ("display", "raw"):
+            raise HTTPException(status_code=400, detail="ids must be display or raw")
+        body, filename = pg.download_newick(og, ids)
+        return Response(
+            content=body,
+            media_type="text/plain",
+            headers={"Content-Disposition": _content_disposition(filename)},
+        )
+
     @app.post("/api/orders")
     async def create_order(request: Request):
         length = request.headers.get("content-length")
@@ -752,7 +1254,7 @@ def create_app(data_dir, static_dir=None) -> FastAPI:
 
 
 def run(args) -> None:
-    app = create_app(args.data_dir, args.static)
+    app = create_app(args.data_dir, args.static, famsa=args.famsa)
     uvicorn.run(app, host=args.host, port=args.port)
 
 
@@ -762,4 +1264,6 @@ def add_parser(subparsers):
     p.add_argument("--host", default="127.0.0.1", help="bind host (default 127.0.0.1)")
     p.add_argument("--port", type=int, default=8000, help="bind port (default 8000)")
     p.add_argument("--static", metavar="PATH", help="built frontend directory to serve at /")
+    p.add_argument("--famsa", default="famsa", metavar="PATH",
+                   help="famsa binary for on-demand alignment (default: famsa on PATH)")
     p.set_defaults(func=run)

@@ -129,3 +129,40 @@ Each entry gains `"metadata": {"clade": "A", "gc": 0.38}`. A missing value is `n
 ### `GET /api/orthogroup/{og}/pattern?limit=200`
 - Returns the OGs whose presence/absence pattern is identical to this one: `{"pattern_id", "total", "orthogroups": [{"orthogroup", "og_idx", "annotations"}]}`.
 - `POST /api/orders {"by": "pattern", "og": "OG0000123"}` returns an order with the pattern group first.
+
+## v2 additions: single-orthogroup detail view
+
+Data sources:
+- OrthoFinder results recorded at import (`--orthofinder`): `MultipleSequenceAlignments/`, `Orthogroup_Sequences/` and `Resolved_Gene_Trees/Resolved_Gene_Trees.txt`.
+- Protein FASTA given at import with `--fasta` (files or directories). These are indexed by gene ID with byte offsets, not copied.
+- If an orthogroup has no MSA but its sequences are available, the server aligns it on demand. It runs the same command OrthoFinder uses, `famsa INPUT OUTPUT -t 1`, with the binary set by `orthopan serve --famsa PATH` (default: `famsa` on `PATH`). Results are cached in `<data_dir>/cache/msa/<OG>.fa`. At most 2 alignments run at once, and only for orthogroups with at most 2,000 sequences.
+
+### `GET /api/meta` (extended)
+`"detail": {"msa": bool, "gene_trees": bool, "sequences": bool, "famsa": bool}`. `famsa` is true when the binary is usable.
+
+### `GET /api/orthogroup/{og}/msa`
+```json
+{"orthogroup": "OG0000123", "source": "orthofinder", "length": 412, "trimmed": false,
+ "rows": [{"genome": "FAM1079-i1-1.1", "row": 5, "gene": "FAM1079-i1-1.1_000123",
+           "raw": "gnl|extdb|FAM1079-i1-1.1_000123", "seq": "MKT-LV..."}]}
+```
+- `source` is `"orthofinder"` or `"famsa"`.
+- Rows are sorted by genome row (tree order), then by gene ID.
+- `row` is the genome row; it is -1 if the gene's genome can't be resolved.
+- `trimmed` uses the same rule as the `trimmed` track. It is null if unknown.
+- Errors: 404 with `{"detail": "<reason>"}` when the orthogroup has no MSA and none can be made (no sequences, no famsa, or too many sequences). 503 when the alignment concurrency limit is busy.
+
+### `GET /api/orthogroup/{og}/gene-tree`
+Pre-order node arrays, like `/api/tree`:
+```json
+{"orthogroup": "OG0000123", "parent": [-1, 0], "length": [0, 0.1], "label": ["n0", "FAM1_x"],
+ "gene": [null, "FAM1079-i1-1.1_000123"], "genome_row": [-1, 5],
+ "duplication": [true, false], "support": [0.8, null]}
+```
+- Leaves are matched to genes and genomes using the OG's membership.
+- `duplication` and `support` come from `Gene_Duplication_Events/Duplications.tsv`, matched by the gene tree's node label.
+- 404 with a reason when there is no tree. OrthoFinder only builds trees for orthogroups with at least 4 genes.
+
+### Downloads
+- `GET /api/orthogroup/{og}/fasta?aligned=0|1&ids=display|raw`: `text/plain` FASTA with `Content-Disposition: attachment; filename="<OG>[.aligned].fa"`. `aligned=1` uses the same source as `/msa`.
+- `GET /api/orthogroup/{og}/gene-tree.nwk?ids=display|raw`: Newick, as an attachment.

@@ -224,7 +224,8 @@ def test_meta_lists_annotations_and_metadata(client):
     body = client.get("/api/meta").json()
     assert {a["name"] for a in body["annotations"]} == {"description", "cog_category"}
     assert {m["name"] for m in body["genome_metadata"]} == {"clade", "size"}
-    assert body["detail"] == {"msa": False, "gene_trees": False, "sequences": False}
+    assert body["detail"] == {
+        "msa": False, "gene_trees": False, "sequences": False, "famsa": False}
 
 
 # --- pattern grouping --------------------------------------------------------
@@ -573,5 +574,6 @@ def test_orthofinder_end_to_end(tmp_path):
     assert manifest["detail"]["sequences"]
     c = TestClient(create_app(out))
     meta = c.get("/api/meta").json()
-    assert meta["detail"] == {"msa": True, "gene_trees": True, "sequences": True}
+    assert meta["detail"] == {
+        "msa": True, "gene_trees": True, "sequences": True, "famsa": False}
     assert any(t["name"] == "geometric_homogeneity" for t in meta["tracks"])

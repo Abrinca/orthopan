@@ -50,6 +50,14 @@ Decisions taken so far (2026-10-04). See `VISION.md` for context and `docs/anvio
 - Copy-number colour mode: a zoomed-out bin shows the mean copy number over its present cells. Absent cells stay white.
 - Order of work: annotations, metadata, search and copy number first; then the single-orthogroup view (MSA viewer, gene tree, members table).
 
+## Single-orthogroup view (v2)
+
+- The detail panel expands into a wide drawer with three tabs: Members, MSA and Gene tree. The matrix stays visible.
+- MSA viewer: our own canvas viewer with no dependencies. Rows are grouped by genome in tree order and residues are coloured. It has a conservation/gap bar, horizontal scroll and zoom, and row labels.
+- Gene tree: rectangular layout, with leaves coloured by a selectable genome metadata field. Duplication nodes come from `Duplications.tsv`.
+- Missing MSAs are aligned on demand with the same FAMSA command OrthoFinder uses, and the results are cached. Non-OrthoFinder inputs supply sequences via `--fasta`, indexed by byte offset.
+- Downloads: unaligned FASTA, aligned FASTA and the Newick gene tree.
+
 ## Per-orthogroup tracks
 
 - Tracks are the extension point. A track file is a TSV with the header `orthogroup<TAB><track>[<TAB><track>...]`, float values, and an empty cell for missing values. Users can supply their own track files as custom tracks.
