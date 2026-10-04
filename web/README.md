@@ -24,9 +24,9 @@ bun run dev         # terminal 2, http://127.0.0.1:5173
 # or against the real backend
 uv run orthopan serve ../scratch/import-smoke/demo-import --port 8000
 
-# production build (type check + bundle) into web/dist
+# production build (type check + bundle) into ../src/orthopan/static
 bun run build
-bun run mock        # serves web/dist at http://127.0.0.1:8000/
+bun run mock        # serves the built UI at http://127.0.0.1:8000/
 ```
 
 ## Interaction

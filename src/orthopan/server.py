@@ -1245,8 +1245,12 @@ def create_app(data_dir, static_dir=None, famsa="famsa") -> FastAPI:
         return {"order": order_id}
 
     if static_dir is None:
-        candidate = Path(__file__).resolve().parents[2] / "web" / "dist"
-        static_dir = candidate if candidate.is_dir() else None
+        packaged = Path(__file__).resolve().parent / "static"
+        if packaged.is_dir():
+            static_dir = packaged
+        else:
+            candidate = Path(__file__).resolve().parents[2] / "web" / "dist"
+            static_dir = candidate if candidate.is_dir() else None
     if static_dir is not None:
         app.mount("/", StaticFiles(directory=str(static_dir), html=True), name="static")
 

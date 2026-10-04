@@ -8,7 +8,10 @@ export default defineConfig({
     },
   },
   build: {
-    outDir: 'dist',
+    // Ship the UI inside the Python package so wheels serve it without bun.
+    outDir: '../src/orthopan/static',
+    emptyOutDir: true,
     sourcemap: true,
+    chunkSizeWarningLimit: 5000,
   },
 });
