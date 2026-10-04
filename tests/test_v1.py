@@ -577,3 +577,11 @@ def test_orthofinder_end_to_end(tmp_path):
     assert meta["detail"] == {
         "msa": True, "gene_trees": True, "sequences": True, "famsa": False}
     assert any(t["name"] == "geometric_homogeneity" for t in meta["tracks"])
+
+
+def test_encode_copies_rounding_boundary():
+    # float32 would give exactly 64.5 -> 64; the true value 64.5000052 -> 65
+    from orthopan.server import _encode_copies
+
+    out = _encode_copies(np.array([[95331, 0, 4]]), np.array([[519554.0, 0.0, 2.0]]))
+    assert out.tolist() == [[65, 0, 15]]

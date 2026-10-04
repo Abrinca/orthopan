@@ -84,6 +84,16 @@ def test_presence_bits_roundtrip(tmp_path):
     assert np.array_equal(unpacked, dense)
 
 
+def test_membership_sorted_by_og_idx(tmp_path):
+    # the server relies on og_idx clustering (row-group pruning) in membership
+    out = _import(tmp_path)
+    membership = pl.read_parquet(out / "membership.parquet")
+    og_idx = membership["og_idx"].to_numpy()
+    assert (np.diff(og_idx) >= 0).all()
+    genome_idx = membership["genome_idx"].to_numpy()
+    assert (np.diff(genome_idx[og_idx == 4]) >= 0).all()  # sorted within an OG
+
+
 def test_membership_sparse_cells(tmp_path):
     out = _import(tmp_path)
     membership = pl.read_parquet(out / "membership.parquet")

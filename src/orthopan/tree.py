@@ -60,14 +60,45 @@ def _matrix(path, strip_prefix=DEFAULT_GENE_PREFIX):
     return labels, np.frombuffer(buf, dtype=bool).reshape(-1, n).T
 
 
+def _jaccard_packed(packed, counts, chunk_bits=8192, block=2048):
+    """Condensed Jaccard distances from a rows x OG packed presence matrix.
+
+    ``inter = X @ X.T`` is accumulated one OG chunk at a time, so no float32
+    copy of the full matrix is ever materialised. ``counts`` is the per-row set
+    bit count.
+    """
+    n, nbytes = packed.shape
+    inter = np.zeros((n, n), np.float32)
+    step = max(1, chunk_bits // 8)
+    block = min(block, n)
+    tmp = np.empty((block, n), np.float32)
+    for c0 in range(0, nbytes, step):
+        c1 = min(c0 + step, nbytes)
+        x = np.unpackbits(packed[:, c0:c1], axis=1, bitorder="big").astype(np.float32)
+        # row-blocked matmul: only a (block, n) temp, never a full (n, n) one
+        for i0 in range(0, n, block):
+            i1 = min(i0 + block, n)
+            out = tmp[: i1 - i0]
+            np.matmul(x[i0:i1], x.T, out=out)
+            inter[i0:i1] += out
+        del x
+    counts = counts.astype(np.float32)
+    union = counts[:, None] + counts[None, :]
+    union -= inter
+    # Jaccard = 1 - inter/union; two empty rows are distance 0 (matches scipy).
+    frac = np.divide(inter, union, out=inter, where=union > 0)
+    np.subtract(1.0, frac, out=frac)
+    frac[union == 0] = 0.0
+    np.fill_diagonal(frac, 0.0)
+    return squareform(frac, checks=False)
+
+
 def _jaccard(matrix):
-    """Condensed Jaccard distances (rows); equals scipy pdist, but fast."""
-    x = matrix.astype(np.float32)
-    inter = x @ x.T
-    union = x.sum(1)[:, None] + x.sum(1)[None, :] - inter
-    dist = 1.0 - np.divide(inter, union, out=np.ones_like(inter), where=union > 0)
-    np.fill_diagonal(dist, 0.0)
-    return squareform(dist, checks=False)
+    """Condensed Jaccard distances (rows); equals scipy pdist, but memory-safe."""
+    packed = np.packbits(matrix, axis=1, bitorder="big")
+    del matrix
+    counts = np.bitwise_count(packed).sum(axis=1, dtype=np.int64)
+    return _jaccard_packed(packed, counts)
 
 
 def _quote(name):
@@ -102,7 +133,10 @@ def upgma_newick(path, strip_prefix=DEFAULT_GENE_PREFIX) -> str:
     labels, matrix = _matrix(path, strip_prefix)
     if len(labels) < 2:
         return _quote(labels[0]) + ";"
-    root = to_tree(linkage(_jaccard(matrix), method="average"))
+    packed = np.packbits(matrix, axis=1, bitorder="big")
+    del matrix  # release the bool matrix before the float32 pairwise matmul
+    counts = np.bitwise_count(packed).sum(axis=1, dtype=np.int64)
+    root = to_tree(linkage(_jaccard_packed(packed, counts), method="average"))
     return _newick(root, labels) + ";"
 
 

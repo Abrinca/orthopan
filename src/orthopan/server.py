@@ -19,6 +19,7 @@ import subprocess
 import tempfile
 import threading
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import quote
 
@@ -40,13 +41,27 @@ MAX_CELLS = 4096
 MAX_CELLS_TOTAL = 4_000_000  # w*h cap per matrix request
 MAX_LIST = 5000
 MAX_BODY = 64 * 1024  # request-body cap for the POST endpoint
-_LRU_SIZE = 24
-_ROW_CHUNK = 512
+_LRU_SIZE = 8  # packed orders kept per cache (each is n_genomes x nbytes)
+_ROW_CHUNK = 48  # rows per _build_packed task (small chunks load-balance well)
 # order ids minted by POST /api/orders
 _DYNAMIC_PREFIX = ("contrast:", "search:", "pattern:")
 _FAMSA_CONCURRENCY = 2
 _FAMSA_MAX_SEQS = 2000
 _FAMSA_TIMEOUT = 120
+# Shared worker pool for the block-parallel matrix/build paths (numpy releases
+# the GIL, so real threads scale on these byte ops).
+_MATRIX_WORKERS = min(os.cpu_count() or 1, 16)
+_MATRIX_POOL: ThreadPoolExecutor | None = None
+_MATRIX_POOL_LOCK = threading.Lock()
+
+
+def _matrix_pool() -> ThreadPoolExecutor:
+    global _MATRIX_POOL
+    if _MATRIX_POOL is None:
+        with _MATRIX_POOL_LOCK:
+            if _MATRIX_POOL is None:
+                _MATRIX_POOL = ThreadPoolExecutor(max_workers=_MATRIX_WORKERS)
+    return _MATRIX_POOL
 
 
 def _famsa_ok(path: str) -> bool:
@@ -275,7 +290,35 @@ class Pangenome:
         self._dup_lock = threading.Lock()
 
         self.tree = self._build_tree()
-        self._packed("tree")  # prewarm the default view
+        self._genomes_json = self._build_genomes_json()
+        self._packed("tree")  # prewarm the default view (fast, ~row-chunked)
+        # Prebuild the frequency order in the background so the first request
+        # for it is warm without delaying startup.
+        threading.Thread(
+            target=self._prewarm, args=("frequency",), daemon=True
+        ).start()
+
+    def _prewarm(self, order: str) -> None:
+        try:
+            self._packed(order)
+        except Exception:  # pragma: no cover - background best effort
+            pass
+
+    def _build_genomes_json(self) -> bytes:
+        rows = []
+        for row in self.genomes.iter_rows(named=True):
+            genome_idx = int(row["genome_idx"])
+            rows.append({
+                "row": int(row["row_order"]),
+                "genome_idx": genome_idx,
+                "name": row["name"],
+                "n_orthogroups": int(row["n_orthogroups"]),
+                "n_genes": int(row["n_genes"]),
+                "metadata": self._genome_meta[genome_idx],
+            })
+        rows.sort(key=lambda r: r["row"])
+        # compact like Starlette's JSONResponse (no ", "/": " padding)
+        return json.dumps(rows, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
     # --- tree ---------------------------------------------------------------
     def _build_tree(self):
@@ -309,11 +352,14 @@ class Pangenome:
             .collect()
             .sort("genome_idx")
         )
-        out = []
-        for m in mem.iter_rows(named=True):
-            gi = int(m["genome_idx"])
-            out.append((gi, self.genome_names[gi], list(m["genes"]), list(m["genes_raw"])))
-        return out
+        names = self.genome_names
+        genome_idx = mem["genome_idx"].to_numpy()
+        genes = mem["genes"].to_list()
+        raws = mem["genes_raw"].to_list()
+        return [
+            (int(g), names[int(g)], gg, rr)
+            for g, gg, rr in zip(genome_idx, genes, raws)
+        ]
 
     def _member_context(self, og_idx: int):
         members = self.og_members(og_idx)
@@ -695,10 +741,21 @@ class Pangenome:
 
     def _build_packed(self, perm: np.ndarray) -> np.ndarray:
         out = np.zeros((self.n_genomes, self.padded_nbytes), np.uint8)
-        for r0 in range(0, self.n_genomes, _ROW_CHUNK):
-            r1 = min(r0 + _ROW_CHUNK, self.n_genomes)
-            dense = np.unpackbits(self.presence_tree[r0:r1], axis=1, bitorder="big")[:, : self.n_og]
+
+        def work(r0, r1):
+            dense = np.unpackbits(
+                self.presence_tree[r0:r1], axis=1, bitorder="big")[:, : self.n_og]
             out[r0:r1, : self.nbytes] = np.packbits(dense[:, perm], axis=1, bitorder="big")
+
+        ranges = [
+            (r0, min(r0 + _ROW_CHUNK, self.n_genomes))
+            for r0 in range(0, self.n_genomes, _ROW_CHUNK)
+        ]
+        if len(ranges) <= 1 or _MATRIX_WORKERS <= 1:
+            for r0, r1 in ranges:
+                work(r0, r1)
+        else:
+            list(_matrix_pool().map(lambda ab: work(*ab), ranges))
         return out
 
     def _packed(self, order: str) -> np.ndarray:
@@ -744,21 +801,45 @@ class Pangenome:
 
     # --- matrix -------------------------------------------------------------
     def matrix_counts(self, order, og0, og1, g0, g1, w, h) -> np.ndarray:
-        """Present-cell count per output bin, ``(h, w)`` int32."""
+        """Present-cell count per output bin, ``(h, w)`` int32.
+
+        The cumsum/popcount are restricted to the window's byte span and split
+        across row bins so the work runs on several cores; the output is
+        bit-identical to the whole-matrix version.
+        """
         packed = self._packed(order)
         col_abs = og0 + _edges(og1 - og0, w)
         row_local = _edges(g1 - g0, h)
-
         b = col_abs >> 3
         r = col_abs & 7
-        sub = packed[g0:g1]
-        bc = np.bitwise_count(sub)
-        cs = np.zeros((sub.shape[0], self.padded_nbytes + 1), np.int32)
-        np.cumsum(bc, axis=1, dtype=np.int32, out=cs[:, 1:])
-        counts = np.bitwise_count(sub[:, b] & MASKS[r])  # (H, w+1)
-        prefix = cs[:, b] + counts  # (H, w+1)
-        colsum = prefix[:, 1:] - prefix[:, :-1]  # (H, w)
-        return np.add.reduceat(colsum, row_local[:-1], axis=0, dtype=np.int32)
+        bmin, bmax = int(b[0]), int(b[-1])
+        br = b - bmin
+        span = bmax - bmin + 1
+        H = g1 - g0
+
+        def work(ha, hb):
+            r0, r1 = int(row_local[ha]), int(row_local[hb])
+            sub = packed[g0 + r0:g0 + r1, bmin:bmax + 1]
+            rl = row_local[ha:hb + 1] - r0
+            cs = np.zeros((sub.shape[0], span + 1), np.int32)
+            np.cumsum(np.bitwise_count(sub), axis=1, dtype=np.int32, out=cs[:, 1:])
+            counts = np.bitwise_count(sub[:, br] & MASKS[r])  # (rows, w+1)
+            prefix = cs[:, br] + counts
+            colsum = prefix[:, 1:] - prefix[:, :-1]
+            return ha, hb, np.add.reduceat(colsum, rl[:-1], axis=0, dtype=np.int32)
+
+        tasks = min(_MATRIX_WORKERS, h)
+        if tasks <= 1 or H < 512:
+            return work(0, h)[2]
+        bounds = np.arange(tasks + 1) * h // tasks
+        out = np.empty((h, w), np.int32)
+        futures = [
+            _matrix_pool().submit(work, int(bounds[i]), int(bounds[i + 1]))
+            for i in range(tasks) if bounds[i + 1] > bounds[i]
+        ]
+        for ha, hb, part in (f.result() for f in futures):
+            out[ha:hb] = part
+        return out
 
     def matrix(self, order, og0, og1, g0, g1, w, h) -> np.ndarray:
         rowsum = self.matrix_counts(order, og0, og1, g0, g1, w, h)
@@ -778,6 +859,8 @@ class Pangenome:
         counts = self.matrix_counts(order, og0, og1, g0, g1, w, h)
         if not counts.any():
             return np.zeros((h, w), np.uint8)
+        # float64 on purpose: float32 shifts values across .5 rounding boundaries
+        counts = counts.astype(np.float64)
         extra = np.zeros((h, w), np.float64)
         if self.mc_og.size:
             inv = self._inverse_perm(order)
@@ -790,9 +873,7 @@ class Pangenome:
                 extra = np.bincount(
                     rb * w + cb, weights=self.mc_extra[sel], minlength=h * w
                 ).reshape(h, w)
-        mean = np.divide(
-            counts + extra, counts, out=np.zeros((h, w), np.float64), where=counts > 0)
-        return np.rint(mean * 10.0).clip(0, 255).astype(np.uint8)
+        return _encode_copies(counts, extra)
 
     # --- annotation track ---------------------------------------------------
     def annotation_track(self, order, og0, og1, w, name) -> np.ndarray:
@@ -934,6 +1015,13 @@ class Pangenome:
         }
 
 
+def _encode_copies(counts: np.ndarray, extra: np.ndarray) -> np.ndarray:
+    """uint8 = round(10 * (present + extra) / present); 0 where nothing is present."""
+    counts = np.asarray(counts, np.float64)
+    mean = np.divide(counts + extra, counts, out=np.zeros(counts.shape), where=counts > 0)
+    return np.rint(mean * 10.0).clip(0, 255).astype(np.uint8)
+
+
 def _window(n_og, n_genomes, og0, og1, g0, g1, w, h):
     og1 = n_og if og1 is None else og1
     g1 = n_genomes if g1 is None else g1
@@ -970,21 +1058,8 @@ def create_app(data_dir, static_dir=None, famsa="famsa") -> FastAPI:
 
     @app.get("/api/genomes")
     def genomes():
-        rows = []
-        for row in pg.genomes.iter_rows(named=True):
-            genome_idx = int(row["genome_idx"])
-            rows.append(
-                {
-                    "row": int(row["row_order"]),
-                    "genome_idx": genome_idx,
-                    "name": row["name"],
-                    "n_orthogroups": int(row["n_orthogroups"]),
-                    "n_genes": int(row["n_genes"]),
-                    "metadata": pg._genome_meta[genome_idx],
-                }
-            )
-        rows.sort(key=lambda r: r["row"])
-        return rows
+        # Built and serialized once at startup; just stream the cached bytes.
+        return Response(content=pg._genomes_json, media_type="application/json")
 
     @app.get("/api/tree")
     def tree():
@@ -1094,26 +1169,14 @@ def create_app(data_dir, static_dir=None, famsa="famsa") -> FastAPI:
             value = row[name]
             tracks[name] = None if value is None or np.isnan(value) else float(value)
         annotations = _annotation_values(pg, og_idx)
-        membership = pg.dir / "membership.parquet"
-        members = []
-        if membership.is_file():
-            mem = (
-                pl.scan_parquet(membership)
-                .select(["og_idx", "genome_idx", "genes", "genes_raw"])
-                .filter(pl.col("og_idx") == og_idx)
-                .collect()
-                .sort("genome_idx")
-            )
-            for m in mem.iter_rows(named=True):
-                genes = list(m["genes"])
-                raw = list(m["genes_raw"])
-                members.append(
-                    {
-                        "genome": pg.genome_names[int(m["genome_idx"])],
-                        "genes": [{"id": g, "raw": r} for g, r in zip(genes, raw)],
-                    }
-                )
-        return {
+        members = [
+            {
+                "genome": genome,
+                "genes": [{"id": g, "raw": r} for g, r in zip(genes, raw)],
+            }
+            for _, genome, genes, raw in pg.og_members(og_idx)
+        ]
+        body = {
             "orthogroup": row["orthogroup"],
             "og_idx": og_idx,
             "n_genomes": int(row["n_genomes"]),
@@ -1126,6 +1189,11 @@ def create_app(data_dir, static_dir=None, famsa="famsa") -> FastAPI:
             "n_same_pattern": int(row["n_same_pattern"]),
             "members": members,
         }
+        # Serialize here: FastAPI's jsonable_encoder is very slow on 10k members.
+        return Response(
+            content=json.dumps(body, ensure_ascii=False, separators=(",", ":")),
+            media_type="application/json",
+        )
 
     @app.get("/api/orthogroup/{og}/pattern")
     def orthogroup_pattern(og: str, limit: int = 200):
