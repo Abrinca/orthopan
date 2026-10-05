@@ -1,6 +1,7 @@
 // OrthoPan viewer: tree, metadata, heatmap, strips, search and detail panel.
 import {
   HttpError,
+  NetworkError,
   getAnnotationTrack,
   getGenomes,
   getMatrix,
@@ -31,6 +32,7 @@ import {formatCopiesExact, formatCopiesMean} from './decode';
 import {Generation, Sequence} from './generation';
 import {Heatmap, colorForValue, copiesLegend, toImageDataFor, FLAT_TILE, tileParams as tileParamsFor, type TileParams} from './matrix';
 import {Metadata, META_COL_W, numericColor} from './metadata';
+import {toasts, errorIdentity} from './toast';
 import {computeConservation} from './msa';
 import {memberSlice, type MemberGroup} from './members';
 import {PendingCache} from './pending';
@@ -105,7 +107,6 @@ const themeSelect = $<HTMLSelectElement>('theme');
 const treeShapeSelect = $<HTMLSelectElement>('tree-shape');
 const sortBtn = $<HTMLButtonElement>('sortbtn');
 const statusEl = $('status');
-const noticeEl = $('notice');
 const legendEl = $('legend');
 const layersEl = $('layers');
 const layerList = $('layer-list');
@@ -155,6 +156,9 @@ let alnOpen = false;
 let alnOg: string | null = null;
 let alnStartOg: string | null = null;
 let alnFromDrawer = false;
+// the inline FAMSA 503 retry also shows a notice; remember it so it can be
+// dismissed when the alignment view closes or moves to another OG
+let alnRetryToast: {id: number; og: string} | null = null;
 let treeField = '';
 
 // members pane: page in genes so huge OGs stay responsive
@@ -286,11 +290,29 @@ const esc = (s: string) =>
 
 const fmtVal = (v: unknown) => (v === null || v === undefined || v === '' ? '—' : String(v));
 
-let noticeTimer = 0;
-function notice(msg: string): void {
-  noticeEl.textContent = msg;
-  window.clearTimeout(noticeTimer);
-  noticeTimer = window.setTimeout(() => (noticeEl.textContent = ''), 6000);
+/** Show a sticky error toast for a failed request (aborts are ignored). */
+function toastError(err: unknown, context?: string): void {
+  const e = err as Error | undefined;
+  if (e?.name === 'AbortError') return;
+  if (err instanceof NetworkError) {
+    // transport failure from any endpoint collapses to one toast
+    toasts().error('server unreachable', {key: 'network', details: {url: err.url, message: err.message}});
+    return;
+  }
+  const http = err instanceof HttpError ? err : null;
+  if (!http) {
+    // client-side failure (bad payload, parse error, ...): keep it context-specific
+    const message = e?.message ?? String(err);
+    const text = context ? `${context} failed: ${message}` : message;
+    toasts().error(text, {key: `client|${context ?? ''}|${message}`, details: {message}});
+    return;
+  }
+  const message = http.detail ?? http.message;
+  const text = context ? `${context} failed: ${message}` : message;
+  toasts().error(text, {
+    key: errorIdentity(context, http.status, message),
+    details: {status: http.status, url: http.url, message},
+  });
 }
 
 // --- initialization ---------------------------------------------------------
@@ -442,6 +464,7 @@ function setupSearch(): void {
     onSelect: (h) => selectHit(h),
     onOrderByHits: (q) => void orderByHits(q),
     onQueryChange: () => scheduleHash(),
+    onError: (err) => toastError(err, 'search'),
   });
 }
 
@@ -540,10 +563,11 @@ async function fetchData(): Promise<void> {
         } catch (err) {
           if (ac.signal.aborted || myGen !== gen) return;
           if (err instanceof HttpError && err.status === 404 && snapOrder !== 'tree') {
-            notice(`unknown order '${snapOrder}' — using tree`);
+            toasts().notice(`unknown order '${snapOrder}' — using tree`);
             setOrder('tree');
             return;
           }
+          toastError(err, 'matrix');
           statusEl.textContent = `error: ${(err as Error).message}`;
         }
       })(),
@@ -571,8 +595,9 @@ async function fetchData(): Promise<void> {
           lastAnnoWorld = lastAnnos.length ? {og0: win.og0, og1: win.og1} : null;
           lastTracksKey = keys.tracks;
           render();
-        } catch {
-          /* tracks are optional */
+        } catch (err) {
+          if (aborted()) return;
+          toastError(err, 'tracks');
         }
       })(),
     );
@@ -612,8 +637,9 @@ async function ensureOgNames(
       ogCache.delete(oldest);
     }
     apply(ids);
-  } catch {
-    /* labels are optional */
+  } catch (err) {
+    if (signal.aborted) return;
+    toastError(err, 'orthogroup labels');
   }
 }
 
@@ -636,6 +662,7 @@ async function ensureOgAnnotations(og: string): Promise<Record<string, unknown>>
       return d.annotations ?? {};
     } catch (err) {
       if (signal.aborted) throw err; // not cached; retried on next hover
+      toastError(err, 'orthogroup details');
       return {};
     } finally {
       if (annoHover?.ctl.signal === signal) annoHover = null;
@@ -1055,7 +1082,7 @@ async function onClick(e: MouseEvent): Promise<void> {
   const hit = bufferAt(lastWin, tr, px, py, meta.n_genomes, meta.n_orthogroups);
   if (!hit) return;
   if (hit.binnedX) {
-    notice('zoom in until the cell covers a single orthogroup to open it');
+    toasts().hint('zoom in until the cell covers a single orthogroup to open it');
     return;
   }
   const my = ++clickSeq;
@@ -1066,8 +1093,9 @@ async function onClick(e: MouseEvent): Promise<void> {
       const ids = await getOrthogroups(order, pos, pos + 1);
       if (my !== clickSeq) return;
       og = ids[0] ?? null;
-    } catch {
+    } catch (err) {
       og = null;
+      toastError(err, 'orthogroup id');
     }
   }
   if (my !== clickSeq || !og) return;
@@ -1118,8 +1146,8 @@ async function jumpToOg(id: string): Promise<void> {
     const res = await apiSearch(id, order, 5);
     const hit = res.hits.find((h) => h.orthogroup === id) ?? res.hits[0];
     if (hit) selectHit(hit);
-  } catch {
-    /* ignore */
+  } catch (err) {
+    toastError(err, 'search');
   }
 }
 
@@ -1128,7 +1156,7 @@ async function orderByHits(q: string): Promise<void> {
     const {order: id} = await postOrder({by: 'search', q});
     setOrder(id);
   } catch (err) {
-    notice(`search order failed: ${(err as Error).message}`);
+    toastError(err, 'search order');
   }
 }
 
@@ -1165,8 +1193,8 @@ function setupDrawer(): void {
     if (!b) return;
     const id = b.dataset.id ?? '';
     navigator.clipboard?.writeText(id).then(
-      () => notice(`copied ${id}`),
-      () => notice('copy failed'),
+      () => toasts().hint(`copied ${id}`),
+      () => toasts().error('copy failed'),
     );
   });
 }
@@ -1314,6 +1342,7 @@ async function renderMembers(og: string): Promise<void> {
   } catch (err) {
     if (!drawerGen.isCurrent(my) || og !== currentOg) return;
     tabMembers.innerHTML = `<h2>error</h2><p>${esc((err as Error).message)}</p>`;
+    toastError(err, 'orthogroup');
   }
 }
 
@@ -1454,6 +1483,10 @@ function hideAlignmentUI(): void {
   alnView.classList.remove('open');
   alnView.hidden = true;
   hideTooltip();
+  if (alnRetryToast) {
+    toasts().dismiss(alnRetryToast.id);
+    alnRetryToast = null;
+  }
 }
 
 function closeAlignment(): void {
@@ -1578,6 +1611,11 @@ function rememberMsa(og: string, m: MsaResult): void {
 
 async function loadAlignment(og: string): Promise<void> {
   const my = beginAlignment();
+  // a pending retry notice belongs to the OG it was raised for
+  if (alnRetryToast && alnRetryToast.og !== og) {
+    toasts().dismiss(alnRetryToast.id);
+    alnRetryToast = null;
+  }
   alnStatusEl.textContent = 'loading…';
   alnBadges.innerHTML = '';
   alnRetry.hidden = true;
@@ -1649,7 +1687,20 @@ async function loadAlignment(og: string): Promise<void> {
     if ((err as Error).name === 'AbortError') return;
     apply(null, (err as Error).message);
     alnStatusEl.textContent = (err as Error).message;
-    if (err instanceof HttpError && err.status === 503) alnRetry.hidden = false;
+    if (err instanceof HttpError && err.status === 503) {
+      alnRetry.hidden = false;
+      const id = toasts().notice('alignment limit busy, try again', {
+        action: {
+          label: 'Retry',
+          onClick: () => {
+            if (alnOpen && alnOg === og) void loadAlignment(og);
+          },
+        },
+      });
+      alnRetryToast = {id, og};
+    } else {
+      toastError(err, 'alignment');
+    }
   }
 }
 
@@ -1713,8 +1764,9 @@ async function loadPattern(og: string, my: number): Promise<void> {
       el.addEventListener('click', () => void jumpToOg((el as HTMLElement).dataset.og!));
     });
     host.querySelector('#order-pattern')!.addEventListener('click', () => void orderByPattern(og));
-  } catch {
+  } catch (err) {
     host.innerHTML = '';
+    toastError(err, 'pattern');
   }
 }
 
@@ -1723,7 +1775,7 @@ async function orderByPattern(og: string): Promise<void> {
     const {order: id} = await postOrder({by: 'pattern', og});
     setOrder(id);
   } catch (err) {
-    notice(`pattern order failed: ${(err as Error).message}`);
+    toastError(err, 'pattern order');
   }
 }
 
@@ -1743,7 +1795,7 @@ async function sortByContrast(): Promise<void> {
     const {order: id} = await postOrder({by: 'contrast', genomes: names});
     setOrder(id);
   } catch (err) {
-    notice(`contrast sort failed: ${(err as Error).message}`);
+    toastError(err, 'contrast sort');
   } finally {
     sortBtn.disabled = false;
   }
@@ -1807,4 +1859,5 @@ function applyHash(): void {
 
 boot().catch((err) => {
   statusEl.textContent = `fatal: ${(err as Error).message}`;
+  toastError(err, 'startup');
 });

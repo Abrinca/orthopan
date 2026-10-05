@@ -22,6 +22,8 @@ export interface SearchBoxOptions {
   onOrderByHits: (q: string) => void;
   /** called on user query changes (typing, clear, Escape), not on restore */
   onQueryChange?: () => void;
+  /** called when a search request fails (never for aborts) */
+  onError?: (err: unknown) => void;
 }
 
 export class SearchBox {
@@ -103,8 +105,9 @@ export class SearchBox {
       if (q !== this.query || order !== this.o.getOrder()) return;
       this.hits = res.hits;
       this.render(res.total, my);
-    } catch {
-      /* aborted or best-effort */
+    } catch (err) {
+      if (ac.signal.aborted) return;
+      this.o.onError?.(err);
     }
   }
 

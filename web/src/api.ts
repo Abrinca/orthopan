@@ -112,6 +112,10 @@ export class HttpError extends Error {
   constructor(
     public status: number,
     message: string,
+    /** request URL (path) when known */
+    public url?: string,
+    /** server-provided error detail when known */
+    public detail?: string,
   ) {
     super(message);
     this.name = 'HttpError';
@@ -120,9 +124,43 @@ export class HttpError extends Error {
 
 const BASE = '';
 
+/** The request never got an HTTP response (server down, connection refused, ...). */
+export class NetworkError extends Error {
+  constructor(public url: string, cause: unknown) {
+    super(`${url}: ${(cause as Error)?.message ?? String(cause)}`);
+    this.name = 'NetworkError';
+  }
+}
+
+/** fetch() that tags transport failures as NetworkError; aborts are re-thrown unchanged. */
+function request(url: string, init?: RequestInit): Promise<Response> {
+  // fetch() is called synchronously so callers' request ordering is unchanged
+  return fetch(url, init).catch((err: unknown) => {
+    if ((err as Error)?.name === 'AbortError' || init?.signal?.aborted) throw err;
+    throw new NetworkError(url, err);
+  });
+}
+
+/** Read an error response's JSON `detail`, falling back to a message. */
+async function errorDetail(res: Response, fallback: string): Promise<{message: string; detail?: string}> {
+  try {
+    const body = (await res.json()) as {detail?: unknown};
+    if (body && body.detail !== undefined) {
+      const detail = String(body.detail);
+      return {message: detail, detail};
+    }
+  } catch {
+    /* not JSON */
+  }
+  return {message: fallback};
+}
+
 async function getJSON<T>(path: string, signal?: AbortSignal): Promise<T> {
-  const res = await fetch(BASE + path, {signal});
-  if (!res.ok) throw new HttpError(res.status, `${path}: HTTP ${res.status}`);
+  const res = await request(BASE + path, {signal});
+  if (!res.ok) {
+    const {message, detail} = await errorDetail(res, `${path}: HTTP ${res.status}`);
+    throw new HttpError(res.status, message, path, detail);
+  }
   return (await res.json()) as T;
 }
 
@@ -161,8 +199,11 @@ export async function getMatrix(p: MatrixParams, signal?: AbortSignal): Promise<
     h: String(p.h),
     value,
   });
-  const res = await fetch(`/api/matrix?${q}`, {signal});
-  if (!res.ok) throw new HttpError(res.status, `/api/matrix: HTTP ${res.status}`);
+  const res = await request(`/api/matrix?${q}`, {signal});
+  if (!res.ok) {
+    const {message, detail} = await errorDetail(res, `/api/matrix: HTTP ${res.status}`);
+    throw new HttpError(res.status, message, `/api/matrix?${q}`, detail);
+  }
   const width = Number(res.headers.get('X-Width') ?? p.w);
   const height = Number(res.headers.get('X-Height') ?? p.h);
   const buf = await res.arrayBuffer();
@@ -188,8 +229,11 @@ export async function getTracks(p: TracksParams, signal?: AbortSignal): Promise<
     w: String(p.w),
     names: p.names.join(','),
   });
-  const res = await fetch(`/api/tracks?${q}`, {signal});
-  if (!res.ok) throw new HttpError(res.status, `/api/tracks: HTTP ${res.status}`);
+  const res = await request(`/api/tracks?${q}`, {signal});
+  if (!res.ok) {
+    const {message, detail} = await errorDetail(res, `/api/tracks: HTTP ${res.status}`);
+    throw new HttpError(res.status, message, `/api/tracks?${q}`, detail);
+  }
   const names = (res.headers.get('X-Tracks') ?? p.names.join(',')).split(',').filter(Boolean);
   const buf = await res.arrayBuffer();
   const count = names.length * p.w;
@@ -218,8 +262,11 @@ export async function getAnnotationTrack(
     w: String(p.w),
     name: p.name,
   });
-  const res = await fetch(`/api/annotation-track?${q}`, {signal});
-  if (!res.ok) throw new HttpError(res.status, `/api/annotation-track: HTTP ${res.status}`);
+  const res = await request(`/api/annotation-track?${q}`, {signal});
+  if (!res.ok) {
+    const {message, detail} = await errorDetail(res, `/api/annotation-track: HTTP ${res.status}`);
+    throw new HttpError(res.status, message, `/api/annotation-track?${q}`, detail);
+  }
   const bins = p.w;
   const buf = await res.arrayBuffer();
   if (buf.byteLength !== bins * 2) {
@@ -259,12 +306,15 @@ export async function postOrder(body: {
   q?: string;
   og?: string;
 }): Promise<{order: string}> {
-  const res = await fetch('/api/orders', {
+  const res = await request('/api/orders', {
     method: 'POST',
     headers: {'content-type': 'application/json'},
     body: JSON.stringify(body),
   });
-  if (!res.ok) throw new HttpError(res.status, `/api/orders: HTTP ${res.status}`);
+  if (!res.ok) {
+    const {message, detail} = await errorDetail(res, `/api/orders: HTTP ${res.status}`);
+    throw new HttpError(res.status, message, '/api/orders', detail);
+  }
   return (await res.json()) as {order: string};
 }
 
@@ -301,16 +351,18 @@ export type IdMode = 'display' | 'raw';
 
 /** Read a JSON error body and surface its `detail` as the error message. */
 async function getJSONDetail<T>(path: string, signal?: AbortSignal): Promise<T> {
-  const res = await fetch(BASE + path, {signal});
+  const res = await request(BASE + path, {signal});
   if (!res.ok) {
     let detail = `${path}: HTTP ${res.status}`;
+    let serverDetail: string | undefined;
     try {
       const body = (await res.json()) as {detail?: unknown};
-      if (body && body.detail !== undefined) detail = String(body.detail);
+      if (body && body.detail !== undefined) serverDetail = String(body.detail);
+      if (serverDetail !== undefined) detail = serverDetail;
     } catch {
       /* not JSON */
     }
-    throw new HttpError(res.status, detail);
+    throw new HttpError(res.status, detail, path, serverDetail);
   }
   return (await res.json()) as T;
 }

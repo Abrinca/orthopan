@@ -80,6 +80,13 @@
         --code-bg: #f2f4f7;
         --sel-bg: #fffbeb;
         --sel-border: #fde68a;
+        --toast-bg: #ffffff;
+        --toast-border: #d0d5dd;
+        --toast-text: #1f2937;
+        --toast-shadow: 0 6px 20px rgba(0,0,0,0.16);
+        --toast-error-bg: #fef2f2;
+        --toast-error-border: #fecaca;
+        --toast-error-text: #b91c1c;
       }
       :root[data-theme='dark'] {
         color-scheme: dark;
@@ -111,6 +118,13 @@
         --code-bg: #1f2937;
         --sel-bg: #3b2f10;
         --sel-border: #a16207;
+        --toast-bg: #111827;
+        --toast-border: #334155;
+        --toast-text: #e5e7eb;
+        --toast-shadow: 0 6px 20px rgba(0,0,0,0.6);
+        --toast-error-bg: #450a0a;
+        --toast-error-border: #7f1d1d;
+        --toast-error-text: #fecaca;
       }
       * { box-sizing: border-box; }
       html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg);
@@ -133,7 +147,25 @@
       /* fixed width so switching auto/light/dark never reflows the header */
       #theme { width: 74px; }
       #status { margin-left: auto; color: var(--faint); white-space: nowrap; }
-      #notice { color: var(--notice); white-space: nowrap; max-width: 34ch; overflow: hidden; text-overflow: ellipsis; }
+      #toast-container { position: fixed; left: 50%; bottom: 16px; transform: translateX(-50%);
+        z-index: 80; display: flex; flex-direction: column; align-items: center; gap: 8px;
+        pointer-events: none; max-width: 96vw; }
+      #toast-container .toast { pointer-events: auto; min-width: 240px; max-width: min(90vw, 560px);
+        background: var(--toast-bg); color: var(--toast-text); border: 1px solid var(--toast-border);
+        border-radius: 6px; box-shadow: var(--toast-shadow); padding: 8px 10px;
+        display: flex; flex-direction: column; gap: 6px; font-size: 12px; }
+      #toast-container .toast-error { background: var(--toast-error-bg); border-color: var(--toast-error-border);
+        color: var(--toast-error-text); }
+      #toast-container .toast-row { display: flex; align-items: center; gap: 8px; }
+      #toast-container .toast-body { flex: 1 1 auto; white-space: pre-wrap; word-break: break-word; }
+      #toast-container .toast-body.clickable { cursor: pointer; text-decoration: underline dotted; }
+      #toast-container .toast-action, #toast-container .toast-details-toggle, #toast-container .toast-close {
+        font: inherit; color: inherit; background: transparent; border: 1px solid currentColor;
+        border-radius: 3px; padding: 2px 8px; cursor: pointer; }
+      #toast-container .toast-details-toggle[aria-expanded='true'] { background: rgba(128, 128, 128, 0.25); }
+      #toast-container .toast-close { border: none; font-size: 14px; line-height: 1; padding: 0 4px; }
+      #toast-container .toast-details { border-top: 1px solid currentColor; padding-top: 5px;
+        font-family: ui-monospace, monospace; font-size: 11px; white-space: pre-wrap; word-break: break-word; }
       #legend { display: inline-flex; align-items: stretch; height: 12px; border: 1px solid var(--border);
         border-radius: 2px; overflow: hidden; vertical-align: middle; }
       #legend span { display: inline-block; min-width: 14px; line-height: 10px; font-size: 8px;
@@ -287,7 +319,6 @@
           <div id="search-results"></div>
         </span>
         <details id="layers"><summary>Layers</summary><div id="layer-list"></div></details>
-        <span id="notice"></span>
         <span id="status">loading…</span>
       </div>
       <div id="body">
