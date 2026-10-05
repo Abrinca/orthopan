@@ -4,12 +4,26 @@ Vite + TypeScript + deck.gl frontend. It talks only to the API in `docs/api.md`.
 
 ## Layout
 
-- `src/api.ts` — typed client for every endpoint.
-- `src/matrix.ts` — deck.gl `BitmapLayer` heatmap, viewport math and colormap.
-- `src/tree.ts` — rectangular dendrogram on Canvas2D, aligned with matrix rows.
-- `src/tracks.ts` — top track strips aligned with matrix columns.
-- `src/main.ts` — wiring: layout, fetches, interaction, URL hash.
-- `mock/server.ts` — synthetic 50 genomes x 2000 OGs API (Bun) serving this contract.
+`src/` modules (plain TypeScript, no framework; deck.gl draws the heatmap, the rest is Canvas2D/DOM):
+
+- `main.ts` — wiring and UI state: boot, fetch lifecycle, render loop, interaction, URL hash, keyboard.
+- `transform.ts` — the shared world↔pixel transform and viewport math (zoom/clamp, window and cell
+  maths, DPR canvas setup). Every matrix-aligned panel uses it.
+- `api.ts` — typed client for every endpoint.
+- `matrix.ts` — deck.gl `BitmapLayer` heatmap and the presence/copy-number colour maths.
+- `tree.ts` — genome dendrogram on Canvas2D, clade selection and hit testing.
+- `tracks.ts` — track strips above the matrix (numeric bars, categorical colours).
+- `annotations.ts` — the categorical annotation palette.
+- `metadata.ts` — genome metadata columns between tree and heatmap.
+- `search.ts` — the search box and hit viewport.
+- `selection.ts` — the selected-genome model and hash encoding.
+- `members.ts` — member-list pagination with pinned genomes.
+- `pending.ts`, `generation.ts` — the shared-promise cache and the stale-response guards.
+- `alignment.ts` — the alignment view (row order, virtual band, renderer).
+- `msa.ts` — MSA column maths, residue colours, conservation.
+- `genetree.ts` — gene-tree layout, `treeNodeX`, leaf colours.
+- `decode.ts` — little-endian binary decoders and copy-number byte maths.
+- `mock/server.ts` — synthetic 50 genomes × 2,000 OGs API (Bun) serving this contract.
 
 ## Run
 
@@ -21,8 +35,8 @@ bun install
 bun run mock        # terminal 1
 bun run dev         # terminal 2, http://127.0.0.1:5173
 
-# or against the real backend
-uv run orthopan serve ../scratch/import-smoke/demo-import --port 8000
+# or against the real backend (built with scripts/build_datasets.sh)
+uv run orthopan serve ../scratch/datasets/demo --port 8000
 
 # production build (type check + bundle) into ../src/orthopan/static
 bun run build

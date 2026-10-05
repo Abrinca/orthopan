@@ -1,6 +1,7 @@
 """Tests for the v1 additions: annotations, metadata, patterns, copies, search."""
 
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -555,7 +556,10 @@ def test_metadata_empty_name_rejected(tmp_path):
 
 # --- end-to-end OrthoFinder import ------------------------------------------
 
-@pytest.mark.skipif(not DEMO.is_dir(), reason="demo results not available")
+@pytest.mark.skipif(
+    os.environ.get("ORTHOPAN_TEST_NO_RESOURCES") == "1" or not DEMO.is_dir(),
+    reason="demo results not available",
+)
 def test_orthofinder_end_to_end(tmp_path):
     out = tmp_path / "demo"
     track = _write(tmp_path, "track.tsv", "orthogroup\tcustom_score\nOG0000000\t1.5\n")

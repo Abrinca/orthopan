@@ -18,7 +18,12 @@ The FastAPI backend serves one imported pangenome directory (see `orthopan impor
   - Built in: `tree` (default) and `frequency`.
   - `track:<name>` and `track:<name>:desc` sort by a track column. Missing values go last.
   - Ids returned by `POST /api/orders`.
-- The server caches permutations, using an LRU for the dynamic ones.
+- Caching: the `tree` and `frequency` **permutations** are precomputed at import; `frequency`'s
+  packed matrix is built in the background at startup. `track:<name>` permutations are **recomputed
+  on every request** (no cache). The packed matrices for `tree`, `frequency` and every `track:*`
+  share one 8-entry LRU, so heavy track sorting can evict `tree` (it is rebuilt transparently on the
+  next request). Dynamic orders (`POST /api/orders`) have their own 8-entry LRU; an evicted id
+  returns 404.
 
 ## Endpoints
 
@@ -44,12 +49,13 @@ The tree as pre-order node arrays, so the client needs no Newick parser:
 - Each value is the fraction of present cells in the bin, scaled to 0–255. At full detail it is 0 or 255.
 - Response headers: `X-Width`, `X-Height`.
 - The total requested output is capped at 4,000,000 cells (`w * h`); larger requests are rejected with 400.
-- Copy-number mode (`value=copies`) is planned for later.
+- Copy-number mode is `value=copies` (see the v1 additions below).
 
 ### `GET /api/tracks?order=&og0=&og1=&w=&names=a,b`
 - Returns a `Float32Array` of `len(names)*w` values, track-major.
 - Each bin holds the mean of its non-missing values. NaN means no values.
 - Response header: `X-Tracks` (the comma-separated names, in order).
+- Without `names`, every track is returned. An unknown `names` entry returns 404.
 
 ### `GET /api/orthogroups?order=&og0=&og1=`
 The orthogroup IDs at those positions, used for labels at high zoom. At most 5,000 per request.
@@ -68,6 +74,7 @@ Details for one orthogroup, addressed by ID:
 ```
 - Returns `{"order": "<id>"}`, which can be used as the `order` parameter.
 - A contrast score is the fraction present inside the selection minus the fraction present outside it. Orthogroups are sorted by this score, descending.
+- A request body larger than 64 KiB returns 413 (checked against `Content-Length` and while streaming).
 
 ## Performance targets
 
@@ -80,9 +87,9 @@ Reference dataset: 2,193 × 50,515. Long-term target: 10k genomes.
 
 - The server is intended to run on localhost; it has no authentication or global request
   limiter.
-- The default `tree` order is packed at startup. Dynamic orders (`POST /api/orders`) are
-  packed lazily on first use, which costs a few hundred milliseconds on the reference
-  dataset; later requests with the same order id are fast.
+- The default `tree` order is packed at startup, and `frequency` is packed in the background.
+  Dynamic orders (`POST /api/orders`) are packed lazily on first use, which costs a few hundred
+  milliseconds on the reference dataset; later requests with the same order id are fast.
 
 ## v1 additions: annotations, genome metadata, search, copy number
 
@@ -111,12 +118,13 @@ Each entry gains `"metadata": {"clade": "A", "gc": 0.38}`. A missing value is `n
 - For a categorical annotation, returns a `Uint16Array` of `w` values.
 - Each value is `1 + index` into `categories` for the most common category in the bin. 0 means missing.
 - Ties go to the lower index.
-- A text annotation returns 400.
+- Response headers: `X-Width` and `X-Categories` (the annotation name).
+- A text annotation, or a name that is not an annotation, returns 400.
 
 ### `GET /api/search?q=&order=&limit=50`
 - Case-insensitive substring search over orthogroup IDs and all text and categorical annotations.
 - Returns `[{"orthogroup", "og_idx", "position", "field", "text"}]`, where `position` is the OG's position in `order`.
-- Results are sorted by position. `limit` is capped at 500. The response also gives the total hit count, as `{"hits": [...], "total": N}`.
+- Results are sorted by position. `limit` is capped at 500. The response also gives the total hit count as `{"hits": [...], "total": N}`; `total` counts **(orthogroup, field) pairs**, so one OG matched in two fields counts twice.
 
 ### `POST /api/orders` (extended)
 `{"by": "search", "q": "transporter"}` returns an order with the hits first, keeping their relative order from `tree`, followed by the rest in `tree` order. The same id rules and LRU apply as for contrast orders.
@@ -128,6 +136,7 @@ Each entry gains `"metadata": {"clade": "A", "gc": 0.38}`. A missing value is `n
 
 ### `GET /api/orthogroup/{og}/pattern?limit=200`
 - Returns the OGs whose presence/absence pattern is identical to this one: `{"pattern_id", "total", "orthogroups": [{"orthogroup", "og_idx", "annotations"}]}`.
+- The list **includes the OG itself**, in `og_idx` order. `limit` is capped at 5,000. The frontend filters the OG out when it displays the list.
 - `POST /api/orders {"by": "pattern", "og": "OG0000123"}` returns an order with the pattern group first.
 
 ## v2 additions: single-orthogroup detail view
@@ -150,7 +159,8 @@ Data sources:
 - Rows are sorted by genome row (tree order), then by gene ID.
 - `row` is the genome row; it is -1 if the gene's genome can't be resolved.
 - `trimmed` uses the same rule as the `trimmed` track. It is null if unknown.
-- Errors: 404 with `{"detail": "<reason>"}` when the orthogroup has no MSA and none can be made (no sequences, no famsa, or too many sequences). 503 when the alignment concurrency limit is busy.
+- Errors: 404 with `{"detail": "<reason>"}` when the orthogroup has no MSA and none can be made (no sequences, no famsa, or too many sequences). 503 when the alignment concurrency limit is busy. A FAMSA failure or timeout (120 s) returns 500.
+- `aligned=1` downloads use the same MSA path, so they can also return 404, 500 or 503.
 
 ### `GET /api/orthogroup/{og}/gene-tree`
 Pre-order node arrays, like `/api/tree`:

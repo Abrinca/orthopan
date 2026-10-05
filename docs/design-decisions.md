@@ -8,6 +8,15 @@ Decisions taken so far (2026-10-04). See `VISION.md` for context and `docs/anvio
 - **Delivery**: local server (`orthopan serve`). A Python backend serves slices of the matrix to a browser UI.
 - **Frontend**: Deck.gl.
 
+## Interpreter
+
+- **Python 3.14, not 3.15.** On 3.15 the installed polars build silently returned `None` from Series
+  methods (`Series.str.*`, `fill_null`, `is_null`, `list.len`) because of a broken expression-dispatch
+  bytecode check; only DataFrame **expressions** worked. Commit `84d6d75` moved the project to 3.14
+  (`requires-python = "==3.14.*"`, `.python-version` = `3.14`) and removed the old polars guard test.
+  Keep using DataFrame expressions (`_field_mask` does) and do not widen the pin until polars works
+  on 3.15 again.
+
 ## Inputs
 
 - The orthologs TSV is required. Both layouts in `docs/ortholog_file_formats_documentation.md` count as flat "group -> genes" mappings, whether they come from `Orthogroups.tsv` or HOG `N*.tsv`. There are no HOG-hierarchy features.
@@ -22,13 +31,14 @@ Decisions taken so far (2026-10-04). See `VISION.md` for context and `docs/anvio
   - server: 0.8 s startup, about 0.6–1 GB memory;
   - full-screen matrix: about 80 ms for presence and about 100 ms for copies;
   - first use of an order: ≤230 ms.
-  Without `--tree`, the UPGMA fallback needs about 1 GB.
+  Without `--tree`, the UPGMA fallback (Jaccard distances + scipy linkage) peaks at about
+  1.15 GB (measured with `orthopan-tree` on the 10k simulation).
 - The **data layer is designed for 10k+ from the start**: sparse Parquet, bit-packed presence/absence, and a backend that serves windowed slices and zoomed-out aggregates.
 - The **renderer starts simple**: it draws only the visible window and requests aggregates from the backend when zoomed out. Server-side tiling can be added later behind the same API.
 
 ## Storage and rendering
 
-- The processed pangenome is a directory of Parquet files queried with DuckDB or polars. There is no server database. Planned files:
+- The processed pangenome is a directory of Parquet files queried with polars. There is no server database. Planned files:
   - `orthogroups.parquet`: per-orthogroup keys and scores.
   - `genomes.parquet`: one row per genome.
   - `membership.parquet`: sparse membership (orthogroup, genome, copies, gene IDs).
@@ -38,7 +48,7 @@ Decisions taken so far (2026-10-04). See `VISION.md` for context and `docs/anvio
 - Backend: FastAPI. It also serves the built frontend.
 - Frontend: Vite + TypeScript + deck.gl, without React.
 - Matrix windows travel as raw binary arrays. The client applies colors. Revisit this if something better turns up.
-- Zoomed-out aggregates are computed on the fly with a numpy block mean over `presence.npy`. Add caching or an import-time pyramid only if 10k genomes turn out too slow.
+- Zoomed-out aggregates are computed on the fly with popcount prefix sums over per-order bit-packed copies of the presence matrix (`_build_packed`/`matrix_counts`), not a numpy block mean of `presence.npy`. Add caching or an import-time pyramid only if 10k genomes turn out too slow.
 - The API contract is in `docs/api.md`.
 - The first build step is `orthopan import`: TSV plus optional tree in, Parquet directory with orderings out.
 
@@ -71,7 +81,7 @@ Decisions taken so far (2026-10-04). See `VISION.md` for context and `docs/anvio
 - Tracks are the extension point. A track file is a TSV with the header `orthogroup<TAB><track>[<TAB><track>...]`, float values, and an empty cell for missing values. Users can supply their own track files as custom tracks.
 - Copy number is a default track, computed at import from the orthologs TSV.
 - Preprocessors live in `src/orthopan/tracks/` and write track TSVs (`python -m orthopan.tracks.<name>`):
-  - `basic`, for any tool: copy number mean/max, paralog fraction, and protein length CV (needs FASTA).
+  - `basic`, for any tool: paralog fraction and protein length CV (needs FASTA). Copy number mean/max are built in at import, not emitted here.
   - `orthofinder`: duplication counts and gene-tree length per leaf.
   - `msa`: anvi'o-style geometric and functional homogeneity, gap fraction, and a trimmed flag.
 - Rationale (`docs/orthofinder-outputs.md`): cluster quality has three nearly independent axes, namely structure, divergence and paralogy. Length CV and copy number cover structure and paralogy without alignments.
@@ -87,6 +97,6 @@ Decisions taken so far (2026-10-04). See `VISION.md` for context and `docs/anvio
 
 - **Default: tree-guided.** Each orthogroup is placed at the DFS position of the MRCA of the genomes containing it. Ties break by clade purity, then frequency. This produces clade-specific blocks above their clades.
 - **Alternate: frequency gradient** (core to accessory).
-- Both are precomputed at import as permutation columns. Per-orthogroup sort keys (frequency, MRCA node, purity, copy number, homogeneity, annotation) are stored as well.
+- Both are precomputed at import as permutation columns. Per-orthogroup sort keys (frequency, MRCA node, purity, copy number, homogeneity) are stored as well.
 - On-demand sorts by any track and clade-contrast sorts ("present in selection, absent elsewhere") run on the server.
 - There is no full hierarchical clustering of orthogroups. 91% of orthogroups are rare accessory, and there are 26k unique patterns, so it costs too much memory for too little benefit.

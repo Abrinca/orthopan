@@ -142,7 +142,7 @@ def upgma_newick(path, strip_prefix=DEFAULT_GENE_PREFIX) -> str:
 
 def main(argv=None) -> None:
     p = argparse.ArgumentParser(description="Genome dendrogram (UPGMA/Jaccard) -> Newick")
-    p.add_argument("input", help="orthologs TSV/TSV.GZ in per-sample matrix format")
+    p.add_argument("input", help="orthologs TSV/TSV.GZ (Format A or B)")
     p.add_argument("-o", "--output", help="output Newick path (default: stdout)")
     a = p.parse_args(argv)
     nwk = upgma_newick(a.input)

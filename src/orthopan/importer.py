@@ -719,21 +719,23 @@ def run(args) -> None:
 
         # --- sequences.parquet (byte-offset index of membership genes) -------
         sequences_path = outdir / "sequences.parquet"
+        if args.fasta and seq_rows:
+            rows_out = [
+                {
+                    "gene": raw, "genome": genome_name,
+                    "file": record[0], "offset": record[1], "length": record[2],
+                }
+                for (raw, genome_name), record in seq_rows.items()
+            ]
+            pl.DataFrame(rows_out, schema={
+                "gene": pl.Utf8, "genome": pl.Utf8,
+                "file": pl.UInt32, "offset": pl.Int64, "length": pl.UInt32,
+            }).write_parquet(sequences_path)
+        elif sequences_path.exists():
+            # No --fasta (or nothing resolved): drop a stale file from a
+            # previous import into the same directory.
+            sequences_path.unlink()
         if args.fasta:
-            if seq_rows:
-                rows_out = [
-                    {
-                        "gene": raw, "genome": genome_name,
-                        "file": record[0], "offset": record[1], "length": record[2],
-                    }
-                    for (raw, genome_name), record in seq_rows.items()
-                ]
-                pl.DataFrame(rows_out, schema={
-                    "gene": pl.Utf8, "genome": pl.Utf8,
-                    "file": pl.UInt32, "offset": pl.Int64, "length": pl.UInt32,
-                }).write_parquet(sequences_path)
-            elif sequences_path.exists():
-                sequences_path.unlink()
             unresolved = fasta_total - len(seq_rows)
             if unresolved:
                 print(

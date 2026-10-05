@@ -80,6 +80,8 @@ def fake_client(fake):
 
 @pytest.fixture(scope="module")
 def demo(tmp_path_factory):
+    if os.environ.get("ORTHOPAN_TEST_NO_RESOURCES") == "1" or not DEMO.is_dir():
+        pytest.skip("resources/orthofinder-demo not available")
     out = tmp_path_factory.mktemp("v2demo") / "out"
     main(["import", "--orthofinder", str(DEMO), "-o", str(out)])
     return out
@@ -297,6 +299,21 @@ def test_fasta_prefix_stripped_headers(tmp_path):
     body = c.get("/api/orthogroup/OG1/fasta", params=dict(ids="raw")).text
     assert body.splitlines()[0] == ">gnl|x|g1"
     assert body.splitlines()[1] == "AAAA"
+
+
+def test_reimport_without_fasta_drops_stale_sequences(tmp_path):
+    matrix = "Orthogroup\tA\tB\nOG1\tgnl|x|g1\t\n"
+    (tmp_path / "matrix.tsv").write_text(matrix)
+    (tmp_path / "tree.nwk").write_text("((A:1,B:1)N0);")
+    _write(tmp_path / "fa" / "A.faa", ">gnl|x|g1\nAAAA\n")
+    out = tmp_path / "out"
+    main(["import", str(tmp_path / "matrix.tsv"), "-o", str(out),
+          "--tree", str(tmp_path / "tree.nwk"), "--fasta", str(tmp_path / "fa")])
+    assert (out / "sequences.parquet").is_file()
+    # a reimport into the same directory without --fasta must not leave it behind
+    main(["import", str(tmp_path / "matrix.tsv"), "-o", str(out),
+          "--tree", str(tmp_path / "tree.nwk")])
+    assert not (out / "sequences.parquet").exists()
 
 
 def test_fasta_equal_length_duplicates(tmp_path):

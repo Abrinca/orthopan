@@ -19,25 +19,19 @@ def _write(tmp_path, name, text):
     return path
 
 
-def test_copy_numbers(tmp_path):
+def test_paralog_fraction(tmp_path):
     rows = basic_tracks(_write(tmp_path, "og.tsv", MATRIX))
     og1, og2, og3 = rows["OG1"], rows["OG2"], rows["OG3"]
-    assert og1["copy_number_mean"] == pytest.approx(4 / 3)
-    assert og1["copy_number_max"] == 2
     assert og1["paralog_fraction"] == pytest.approx(1 / 3)
-    assert og2["copy_number_mean"] == 1
-    assert og2["copy_number_max"] == 1
     assert og2["paralog_fraction"] == 0
-    assert og3 == {"copy_number_mean": None, "copy_number_max": None,
-                   "paralog_fraction": None, "length_cv": None}
+    assert og3 == {"paralog_fraction": None, "length_cv": None}
 
 
-def test_copy_numbers_gnl_prefix(tmp_path):
+def test_paralog_fraction_gnl_prefix(tmp_path):
     # Real OrthoFinder IDs carry a `gnl|extdb|` prefix; cell count is by commas only.
     text = "Orthogroup\tA\tB\nOG1\tgnl|extdb|x_1, gnl|extdb|x_2\tgnl|extdb|y_1\n"
     row = basic_tracks(_write(tmp_path, "p.tsv", text))["OG1"]
-    assert row["copy_number_max"] == 2
-    assert row["copy_number_mean"] == pytest.approx(1.5)
+    assert row["paralog_fraction"] == pytest.approx(0.5)
 
 
 def test_length_cv_filled_and_gaps(tmp_path):
@@ -80,16 +74,15 @@ def test_short_rows_padded(tmp_path):
     # Width comes from the header; a short row is just fewer present genomes.
     text = "Orthogroup\tA\tB\tC\nOG1\tg1\nOG2\t\tg2\n"
     rows = basic_tracks(_write(tmp_path, "s.tsv", text))
-    assert rows["OG1"] == {"copy_number_mean": 1, "copy_number_max": 1,
-                           "paralog_fraction": 0, "length_cv": None}
-    assert rows["OG2"]["copy_number_mean"] == 1
+    assert rows["OG1"] == {"paralog_fraction": 0, "length_cv": None}
+    assert rows["OG2"]["paralog_fraction"] == 0
 
 
 def test_headerless(tmp_path):
     text = "OG1\tg1, g2\tg1\nOG2\t\tg1\n"
     rows = basic_tracks(_write(tmp_path, "nh.tsv", text))
-    assert rows["OG1"]["copy_number_mean"] == pytest.approx(1.5)
-    assert rows["OG2"]["copy_number_max"] == 1
+    assert rows["OG1"]["paralog_fraction"] == pytest.approx(0.5)
+    assert rows["OG2"]["paralog_fraction"] == 0
 
 
 def test_gz_input_matches_plain(tmp_path):

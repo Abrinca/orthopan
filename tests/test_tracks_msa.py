@@ -1,6 +1,7 @@
 """Tests for orthopan.tracks.msa."""
 
 import importlib.util
+import os
 import sys
 import types
 from pathlib import Path
@@ -9,6 +10,9 @@ import numpy as np
 import pytest
 
 from orthopan.tracks import msa as M
+
+ANVIO_HOMOGENEITY = (Path(__file__).resolve().parents[1]
+                     / "resources/anvio/anvio/homogeneityindex.py")
 
 # ---------------------------------------------------------------------------
 # anvi'o reference: load homogeneityindex.py with lightweight stubs and a naive
@@ -74,14 +78,24 @@ def _load_anvio():
     ut.is_amino_acid_functionally_conserved = _conserved
     sys.modules.update({"anvio": an, "anvio.terminal": term, "anvio.utils": ut})
     an.terminal, an.utils = term, ut
-    path = Path(__file__).resolve().parents[1] / "resources/anvio/anvio/homogeneityindex.py"
-    spec = importlib.util.spec_from_file_location("anvio_homogeneityindex", path)
+    spec = importlib.util.spec_from_file_location("anvio_homogeneityindex", ANVIO_HOMOGENEITY)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod.HomogeneityCalculator()
 
 
-_ANVIO = _load_anvio()
+_ANVIO = None
+
+
+@pytest.fixture(scope="module")
+def anvio():
+    """anvi'o's HomogeneityCalculator; only the reference-comparison tests need it."""
+    global _ANVIO
+    if os.environ.get("ORTHOPAN_TEST_NO_RESOURCES") == "1" or not ANVIO_HOMOGENEITY.is_file():
+        pytest.skip("resources/anvio not available")
+    if _ANVIO is None:
+        _ANVIO = _load_anvio()
+    return _ANVIO
 
 
 # ---------------------------------------------------------------------------
@@ -100,18 +114,18 @@ HANDMADE = [
 
 
 @pytest.mark.parametrize("seqs", HANDMADE)
-def test_pooled_geometric_matches_anvio(seqs):
+def test_pooled_geometric_matches_anvio(anvio, seqs):
     ours = M.msa_metrics(seqs, None)["geometric_homogeneity"]
-    assert ours == pytest.approx(_ANVIO.compute_geometric_index(seqs), abs=1e-12)
+    assert ours == pytest.approx(anvio.compute_geometric_index(seqs), abs=1e-12)
 
 
 @pytest.mark.parametrize("seqs", HANDMADE)
-def test_pooled_functional_matches_anvio(seqs):
+def test_pooled_functional_matches_anvio(anvio, seqs):
     ours = M.msa_metrics(seqs, None)["functional_homogeneity"]
-    assert ours == pytest.approx(_ANVIO.compute_functional_index(seqs), abs=1e-12)
+    assert ours == pytest.approx(anvio.compute_functional_index(seqs), abs=1e-12)
 
 
-def test_pooled_matches_anvio_random():
+def test_pooled_matches_anvio_random(anvio):
     rng = np.random.default_rng(0)
     alphabet = "ACDEFGHIKLMNPQRSTVWYBZJX--"
     for _ in range(150):
@@ -122,10 +136,10 @@ def test_pooled_matches_anvio_random():
             continue  # anvi'o keeps all-gap columns; ours drops them
         ours = M.msa_metrics(seqs, None)
         assert ours["geometric_homogeneity"] == pytest.approx(
-            _ANVIO.compute_geometric_index(seqs), abs=1e-12
+            anvio.compute_geometric_index(seqs), abs=1e-12
         )
         assert ours["functional_homogeneity"] == pytest.approx(
-            _ANVIO.compute_functional_index(seqs), abs=1e-12
+            anvio.compute_functional_index(seqs), abs=1e-12
         )
 
 

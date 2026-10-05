@@ -1,7 +1,9 @@
-"""Basic per-orthogroup tracks: copy number and protein-length variation.
+"""Basic per-orthogroup tracks: paralog fraction and protein-length variation.
 
-Works with any orthology tool that emits Format B (per-sample matrix); parsing
-is delegated to :mod:`orthopan.io`. ``length_cv`` needs protein FASTA
+Copy number is **not** here: ``orthopan import`` always computes
+``copy_number_mean``/``copy_number_max``, and a track with those names would
+collide with the built-in columns. Works with any orthology tool in Format A or
+B; parsing is delegated to :mod:`orthopan.io`. ``length_cv`` needs protein FASTA
 (``--fasta``) to look up gene lengths; gene ID is the first whitespace-delimited
 word of the header. Only lengths are held, not sequences.
 """
@@ -14,7 +16,7 @@ from pathlib import Path
 from orthopan.io import open_text, read_matrix, split_genes
 from orthopan.tracks import write_tracks
 
-COLUMNS = ["copy_number_mean", "copy_number_max", "paralog_fraction", "length_cv"]
+COLUMNS = ["paralog_fraction", "length_cv"]
 
 _FASTA_SUFFIXES = (".fa", ".faa", ".fasta")
 
@@ -120,7 +122,7 @@ def _length_cv(vals) -> float | None:
 
 
 def basic_tracks(path, fasta=()) -> dict[str, dict[str, float | None]]:
-    """Return {orthogroup: {track: value}} for the four basic tracks."""
+    """Return {orthogroup: {track: value}} for the two basic tracks."""
     labels, rows = read_matrix(path)
     lengths = load_lengths(fasta, labels) if fasta else {}
     result: dict[str, dict[str, float | None]] = {}
@@ -131,8 +133,6 @@ def basic_tracks(path, fasta=()) -> dict[str, dict[str, float | None]]:
             continue
         present = len(copies)
         values: dict[str, float | None] = {
-            "copy_number_mean": sum(copies) / present,
-            "copy_number_max": float(max(copies)),
             "paralog_fraction": sum(c > 1 for c in copies) / present,
             "length_cv": None,
         }
@@ -146,8 +146,8 @@ def basic_tracks(path, fasta=()) -> dict[str, dict[str, float | None]]:
 
 
 def main(argv=None) -> None:
-    p = argparse.ArgumentParser(description="Basic copy-number and length tracks for orthogroups")
-    p.add_argument("input", help="orthogroups TSV/TSV.GZ in per-sample matrix format")
+    p = argparse.ArgumentParser(description="Paralog-fraction and length-CV tracks for orthogroups")
+    p.add_argument("input", help="orthologs TSV/TSV.GZ (Format A or B)")
     p.add_argument("--fasta", nargs="+", default=[], metavar="PATH",
                    help="protein FASTA files or directories (for length_cv)")
     p.add_argument("-o", "--output", help="output TSV path (default: stdout)")

@@ -13,7 +13,7 @@ Requires Python 3.14 and [uv](https://docs.astral.sh/uv/).
 ```sh
 git clone <repo> && cd orthopan
 uv sync
-cd web && bun install && bun run build && cd ..   # builds the UI into src/orthopan/static
+(cd web && bun install && bun run build)   # builds the UI into src/orthopan/static
 ```
 
 [Bun](https://bun.sh) is only needed to build the UI. A wheel built with `uv build` already
@@ -32,7 +32,7 @@ uv run orthopan serve out
 - **Matrix:** genomes are rows (in genome tree order) and orthogroups are columns. The mouse wheel zooms orthogroups, Shift+wheel zooms genomes, and dragging pans.
 - **Order:** sorts the orthogroups by tree position (default), frequency or any track. Select a clade in the tree and choose "sort by contrast" to bring that clade's genes to the front.
 - **Click a cell:** the drawer shows the orthogroup's members, with the clicked genome's genes at the top. **Open alignment view** shows the gene tree, gene names and MSA side by side.
-- **Keys:** ←/→ step to the previous or next orthogroup; Esc closes the current view.
+- **Keys:** ←/→ (and `[`/`]`) step to the previous or next orthogroup; Esc closes the current view.
 - **Other controls:** search box, presence/copy-number toggle, layers menu for tracks and annotations, and downloads (FASTA, aligned FASTA, Newick) for each orthogroup.
 
 The URL keeps the current view, so you can bookmark or share it.
@@ -58,13 +58,26 @@ uv run orthopan import orthologs.tsv -o out --tree tree.nwk \
     --annotation descriptions.tsv --genome-metadata metadata.tsv
 ```
 
-Track files can be made with the preprocessors, and a genome tree with `orthopan-tree`:
+Track files can be made with the preprocessors, and a genome tree with `orthopan-tree`
+(which accepts both matrix layouts):
 
 ```sh
 uv run python -m orthopan.tracks.basic orthologs.tsv -o basic.tsv
 uv run python -m orthopan.tracks.orthofinder RESULTS_DIR -o orthofinder.tsv
-uv run python -m orthopan.tracks.msa RESULTS_DIR/MultipleSequenceAlignments -o msa.tsv
+uv run python -m orthopan.tracks.msa RESULTS_DIR/MultipleSequenceAlignments \
+    --orthogroups RESULTS_DIR/Orthogroups/Orthogroups.tsv \
+    --seqs RESULTS_DIR/Orthogroup_Sequences -o msa.tsv
 uv run orthopan-tree orthologs.tsv -o tree.nwk
+```
+
+`tracks.msa` needs `--orthogroups` for per-genome weighting (without it the run falls back to
+pooled anvi'o weighting, with a warning) and `--seqs` for the `trimmed` column (otherwise it is
+empty). `tracks.basic` emits only `paralog_fraction` and `length_cv`; `copy_number_mean` and
+`copy_number_max` are built in at import, so a `basic.tsv` can be passed to `--track` as is. A
+generated track file can be fed back into an import with `--track`:
+
+```sh
+uv run orthopan import orthologs.tsv -o out --tree tree.nwk --track basic.tsv
 ```
 
 Orthogroups without an alignment are aligned on demand if
@@ -72,12 +85,14 @@ Orthogroups without an alignment are aligned on demand if
 
 ## Development
 
+How the code works internally is described in [docs/implementation.md](docs/implementation.md).
+
 ```sh
 uv run pytest
-cd web && bun test
-bun run dev     # UI dev server, proxies /api to 127.0.0.1:8000
-bun run mock    # mock API on :8000, no backend needed
-uv build        # wheel including the built UI
+(cd web && bun test)
+(cd web && bun run dev)     # UI dev server, proxies /api to 127.0.0.1:8000
+(cd web && bun run mock)    # mock API on :8000, no backend needed
+uv build                    # wheel including the built UI
 ```
 
 To get a large test dataset, run `uv run python scripts/simulate_pangenome.py --help`. It writes
