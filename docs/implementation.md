@@ -850,10 +850,11 @@ This is plain TypeScript with no framework. deck.gl draws the heatmap. Everythin
 | Module | Responsibility |
 | --- | --- |
 | `main.ts` | Wiring and all mutable UI state: boot, fetch lifecycle, render loop, interaction, tooltips, drawer, alignment-view orchestration, URL hash, keyboard. |
+| `theme.ts` | Theme resolution (`auto`/`light`/`dark` → `light`/`dark`), the light/dark `Palette`, `palette()`, and the live store (`initTheme`, `setThemeSetting`, `onThemeChange`). The single source of colour for the Canvas2D panels and deck.gl. |
 | `transform.ts` | The shared world↔pixel transform, view clamping and zoom, window and cell math, `prepareCanvas` (DPR). Pure functions apart from `prepareCanvas`. |
-| `api.ts` | Typed client for every endpoint, plus binary payload size checks and `HttpError`. |
+| `api.ts` | Typed client for every endpoint, plus binary payload size checks, `HttpError` and `NetworkError`. |
 | `decode.ts` | Little-endian `Uint16`/`Float32` decoders and the copy-number byte maths. |
-| `matrix.ts` | The presence colormap (gamma LUT), the copies palette, `toImageDataFor`, and the `Heatmap` class (deck.gl `Deck` + `BitmapLayer`). |
+| `matrix.ts` | The themed presence colormap (gamma LUT), the copies palette, `toImageDataFor`, the tile maths, the `TiledBitmapLayer` rounded-cell shader, and the `Heatmap` class (deck.gl `Deck` + layer, with a flat fallback). |
 | `tree.ts` | `Tree`: the genome dendrogram on Canvas2D (phylogram or cladogram), clade selection and hit testing. |
 | `tracks.ts` | `Tracks`: numeric bar strips and categorical colour strips above the matrix, `robustDomain`, strip hit testing, `fmt3`. |
 | `annotations.ts` | The categorical palette (12 colours, then grey) and value → colour and label helpers. |
@@ -863,6 +864,9 @@ This is plain TypeScript with no framework. deck.gl draws the heatmap. Everythin
 | `members.ts` | `memberSlice`: pagination of the member list, with selected genomes pinned. |
 | `pending.ts` | `PendingCache`: a bounded memo cache that shares in-flight promises. |
 | `generation.ts` | `Generation` (counter + `AbortController`) and `Sequence` (bare token) for stale-response guards. |
+| `requestkey.ts` | `requestKeys`/`needsFetch`: dedupe keys for the matrix window and its track/annotation layers. |
+| `dropdown.ts` | `placeDropdown`/`trackDropdown`: position-fixed dropdowns anchored to a top-bar control. |
+| `toast.ts` | The toast queue (dedupe, max-3 eviction, pause/resume) and the bottom-centre container: `hint`/`notice`/`error`. |
 | `alignment.ts` | Alignment-view maths (row order, virtual band, neighbour stepping) and the `AlignmentView` renderer. |
 | `msa.ts` | MSA column maths (zoom and scroll clamping, visible columns), residue colours, conservation. |
 | `genetree.ts` | Gene-tree layout (`layoutGeneTree`), `treeNodeX`, leaf colours. |
@@ -915,11 +919,18 @@ Both call `onDprChange()`, which runs `heatmap.resyncDpr()` (`useDevicePixels` p
 view/order/mode/layers change
    └─ scheduleFetch(): gen++, abort `inflight`, debounce 140 ms
         └─ fetchData(): snapshot (gen, order, mode, window), new AbortController
-             1. getMatrix ──▶ (stale? return) ──▶ lastMat/lastWin/dataOrder, setData, render
-             2. getTracks ∥ getAnnotationTrack×N ──▶ (stale? return) ──▶ lastTracks/lastAnnos, render
-             3. ensureOgNames (only if og1−og0 ≤ 5000) ──▶ activeOgs (labels, ogAt)
-             404 on a non-tree order ──▶ notice + setOrder('tree')
+             0. requestKeys(order, value, window, tracks, annos) ─▶ needsFetch(lastMatrixKey, lastTracksKey, hasMatrix)
+                (unchanged key with a displayed matrix ⇒ nothing to fetch)
+             1. in parallel, each with its own stale check (needed ones only):
+                ├─ getMatrix ──▶ (stale? return) ──▶ lastMat/lastWin/dataOrder, setData, render
+                │       404 on a non-tree order ──▶ notice toast + setOrder('tree')
+                ├─ getTracks ∥ getAnnotationTrack×N ──▶ (stale? return) ──▶ lastTracks/lastAnnos, render
+                └─ ensureOgNames (only if og1−og0 ≤ 5000) ──▶ activeOgs (labels, ogAt)
 ```
+
+**Request dedupe** (`requestkey.ts`). `requestKeys(order, value, win, tracks, annos)` builds `matrix = "<order>|<value>|og0|og1|g0|g1|w|h"` and `tracks = matrix + "|<tracks>|<annos>"`. `fetchData` keeps `lastMatrixKey`/`lastTracksKey`; `needsFetch` skips the matrix fetch when the key is unchanged and a matrix is already displayed (`hasMatrix = lastMat !== null && dataOrder === order`), and skips the track fetch only when the composite track key is unchanged. A layers-only change fetches tracks and annotations without refetching the matrix. `setOrder` clears `dataOrder` and both keys, so the next call always refetches. This stops a tracks-only change from re-requesting the matrix; a theme change never calls `fetchData` at all.
+
+**Transport errors** (`api.ts`). `request()` wraps `fetch` and throws `NetworkError(url, cause)` when there was no HTTP response; aborts are re-thrown unchanged. `toastError` turns an `HttpError` into `"<context> failed: <detail>"` keyed by `errorIdentity(context, status, message)`, a non-HTTP client-side failure into a context-keyed error, and **collapses every `NetworkError` to one `"server unreachable"` toast** keyed `network`, with the URL and message in the details.
 
 **Stale-response rules.**
 
@@ -953,14 +964,49 @@ view/order/mode/layers change
 
 ### 7.5 Heatmap rendering
 
-`toImageDataFor(mode, values, w, h)` expands the server's one-byte bins into RGBA `ImageData`.
+`toImageDataFor(mode, values, w, h, theme)` expands the server's one-byte bins into an RGBA `ImageData`, using the theme's palette.
 
-- **Presence:** a 256-entry LUT built from `displayT(v)`. Zero is white. Non-zero values map to `0.12 + 0.88·(v/255)^0.45` on a five-stop blue ramp. The gamma and the floor keep sparse bins visible at low zoom. `colorForValue` drives the legend gradient.
-- **Copies:** `copiesBucket(v) = clamp(round(v/10), 1, 5)` for `v > 0` selects one of six discrete colours: absent, 1, 2, 3, 4 and 5+ (`COPIES_COLORS`). The tooltip shows `formatCopiesMean` for binned cells and `formatCopiesExact` for single cells. A saturated byte (255) is shown as `≥25.5`.
+- **Presence:** a 256-entry LUT built from `displayT(v)`. Absent (`v = 0`) is the first stop — near-white in light, near-background dark navy in dark. Non-zero values map to `0.12 + 0.88·(v/255)^0.45` on the theme's five-stop ramp. The gamma and the floor keep sparse bins visible at low zoom. `colorForValue` drives the legend gradient.
+- **Copies:** `copiesBucket(v) = clamp(round(v/10), 1, 5)` for `v > 0` selects one of six discrete colours (absent, 1, 2, 3, 4 and 5+) from `palette().copiesColors`. The tooltip shows `formatCopiesMean` for binned cells and `formatCopiesExact` for single cells. A saturated byte (255) is shown as `≥25.5`.
+- The image's **alpha channel is only a presence mask** for the tile shader; the flat path ignores it.
 
-`Heatmap.setData` replaces a single `BitmapLayer` (`id: 'matrix'`). The deck controller only enables `dragPan`. Wheel zoom is handled in `bindInteractions` (plain wheel zooms the OG axis, Shift+wheel the genome axis) and pushed back with `heatmap.setView`. `onViewStateChange` clamps the controller's state and writes it back (controlled mode).
+**Rounded tiles.** At high zoom the heatmap draws rounded cells via `TiledBitmapLayer`, a `BitmapLayer` subclass whose fragment shader (`TILE_FS`) applies a per-cell rounded box (`sd_round_box`) from a `tile` uniform block (`tileModule`). `heatmapTileParams()` is passed to `Heatmap.setData` and read on every deck.gl frame:
 
-### 7.6 Tree, tracks, annotation strips and metadata columns
+- Tiles are used only when the window is at full detail on **both** axes (`!binnedX && !binnedY`); any binned window stays flat.
+- `tileFade(minCellPx)` is the activation: 0 at ≤ `TILE_MIN_PX = 6` CSS px, 1 at ≥ `TILE_FULL_PX = 10`, smoothstepped between. `mix = 0` reproduces the flat rendering exactly (the shader early-returns).
+- Gap ≈ `TILE_GAP_FRAC = 0.12` of the cell, clamped to `[TILE_GAP_MIN, TILE_GAP_MAX] = [1, 3]` CSS px; corner radius ≈ `TILE_RADIUS_FRAC = 0.25` of the smaller side, clamped so it never collapses into the gap. Sizes are multiplied by `devicePixelRatio` for framebuffer pixels.
+- Absent tiles are multiplied by `palette().absentDarken` (0.955 in light, 1.0 in dark).
+- The hover outline in `drawOverlay` follows the same rounded shape (`roundRectPath`) once `mix > 0.5`.
+
+**Flat fallback.** luma.gl reports shader compile/link failures only through `console.error` (deck's `onError` never fires). The inline `<head>` script in `index.html` hooks `console.error` **before** the bundle captures it and forwards shader-looking messages to `window.__onShaderError`, which `Heatmap` installs. `Heatmap.handleError` sets `flat = true` permanently (exposed as `usingFlat`), warns once, and rebuilds the layer as a plain `BitmapLayer` over an opaque copy of the image. The layer's `onError` calls the same handler.
+
+`Heatmap.setData` replaces a single layer (`id: 'matrix'`). The deck controller only enables `dragPan`. Wheel zoom is handled in `bindInteractions` (plain wheel zooms the OG axis, Shift+wheel the genome axis) and pushed back with `heatmap.setView`. `onViewStateChange` clamps the controller's state and writes it back (controlled mode).
+
+### 7.6 Theming
+
+`theme.ts` is the single source of colour. The user setting is `auto` | `light` | `dark`; `resolveTheme` maps it to `light`/`dark`, with `auto` following `prefers-color-scheme`.
+
+- `document.documentElement.dataset.theme` drives the CSS custom properties in `index.html`, so all DOM chrome (top bar, panels, tooltips, toasts) follows the theme.
+- `LIGHT_PALETTE` / `DARK_PALETTE` hold the same values in TypeScript for the Canvas2D panels and deck.gl; `palette()` returns the current one. Each theme has its own presence/numeric ramp and categorical colours (dark uses brighter categories and a navy → cyan → pale-yellow presence ramp).
+- **Monotonic ramps.** Both presence ramps are monotonic in luminance, in opposite directions: light runs white → dark blue as presence rises, dark runs near-background → pale yellow. The copies ramps are monotonic too. `theme.test.ts` pins this, so a bin value maps to one colour within a theme.
+- **Live switching, no refetch.** `setThemeSetting` persists to `localStorage` (`orthopan.theme`), updates the `data-theme` attribute and notifies listeners. `main.ts` registers `onThemeChange(() => applyTheme())`; `applyTheme` re-rasterises the current matrix image with the new theme (`refreshHeatmapRaster`), re-renders the panels and redraws the alignment view. It never calls `fetchData`.
+- **First paint.** An inline `<head>` script reads the same `localStorage` key and `prefers-color-scheme` and sets `data-theme` (plus a `color-scheme` meta) before the bundle loads, so there is no light flash. `initTheme()` re-reads the setting at boot and starts a `matchMedia` listener that re-resolves `auto` on OS changes.
+
+### 7.7 Notifications (toasts)
+
+`toast.ts` is a small bottom-centre message queue. The pure `ToastQueue` (clock-injected) does dedupe, cap and timing; `ToastContainer` does the DOM. `toasts()` lazily creates one container.
+
+- Three kinds with different lifetimes (`TOAST_DURATIONS`): `hint` 3 s, `notice` 6 s, `error` **sticky** until closed (`×`).
+- **Hints** with the same text restart the existing toast and its timer instead of stacking.
+- **Errors** dedupe by key (`errorIdentity`): `<context>|<status>|<message>` for HTTP errors, `network` for any transport failure, `client|<context>|<message>` for client-side ones. A repeat bumps a visible `×N` count and updates the details in place. Errors carry collapsible `details` (status/url/message) and use `role="alert"`.
+- **Notices** may carry an action, for example the 503 alignment toast with a **Retry** button.
+- At most `MAX_TOASTS = 3` are shown; the oldest auto-dismissing toast is evicted first, otherwise the oldest. Sticky errors survive while auto toasts remain.
+- Hovering a toast **pauses** its countdown; leaving resumes it with at least `RESUME_MIN_MS = 1500` left.
+- No keyboard shortcuts: toasts are mouse-only (hover to pause, `×` to close), and the container is `pointer-events: none` except on the toasts, so it never blocks the matrix.
+
+Usage in `main.ts`: `toasts().hint('zoom in until the cell covers a single orthogroup to open it')` on a binned click; `toasts().hint('copied <id>')` / `toasts().error('copy failed')`; `toasts().notice("unknown order '<x>' — using tree")` on a 404 order; `toasts().notice('alignment limit busy, try again', {action: {label: 'Retry', …}})` on a 503 MSA; and `toastError(err, context)` for every failed request (the NetworkError collapse is in §7.4).
+
+### 7.8 Tree, tracks, annotation strips and metadata columns
 
 - **Tree** (`Tree.load` / `draw`): rebuilds children, cumulative branch-length depth, edge depth and leaf-row intervals from `/api/tree` arrays. Only strictly earlier parents are accepted, which guards against cycles. Node y is the centre of its row interval. Node x uses depth (phylogram), or edge count with tips aligned (cladogram, also used automatically when branch lengths are degenerate). `hitTest` picks the nearest horizontal branch within 7 px. A selected node tints its clade on the tree, labels and overlay canvases, and shows "sort by contrast" when the clade has more than one genome.
 - **Tracks** (`Tracks.draw`): the strip area (`--track-h`, 68 px) is divided evenly between the active strips.
@@ -971,7 +1017,7 @@ view/order/mode/layers change
 - **Metadata** (`Metadata.draw`): one 16 px column (`META_COL_W`) per field, drawn only for visible rows, with rotated headers. Categorical values use the palette by category index. Numeric values use a five-stop gradient between the meta `min` and `max`.
 - **Labels and OG names:** genome names are drawn when rows are at least 11 px tall. Below that the label column collapses to 14 px. OG IDs are drawn rotated on the overlay when columns are at least 24 px wide and the names for the window are loaded.
 
-### 7.7 Search
+### 7.9 Search
 
 `SearchBox`:
 
@@ -983,11 +1029,11 @@ Selecting a hit calls `selectHit`, which centres the hit at 40 px per OG with `h
 
 `setQuery()` restores the query from the hash without causing a hash update.
 
-### 7.8 The drawer and Members
+### 7.10 The drawer and Members
 
 A click on a cell (a pointer move of at most 4 px counts as a click) works like this:
 
-1. If the cell aggregates several OGs, the UI shows a notice asking the user to zoom in.
+1. If the cell aggregates several OGs, a hint toast asks the user to zoom in.
 2. Otherwise the OG ID comes from `activeOgs` or from a one-item `/api/orthogroups` request.
 3. The genome selection is `singleSelection(name)`, or `rangeSelection(names, [r0, r1])` when the row bin covers several genomes.
 4. `openDrawer(og, sel)` runs. For a new OG, it starts a drawer generation, sets the download links, probes for a gene tree (which disables the Newick link if there is none) and renders the members. For the same OG with a new selection, it only re-renders the selection block and the list.
@@ -1000,16 +1046,16 @@ A click on a cell (a pointer move of at most 4 px counts as a click) works like 
 - **The member list:** `memberSlice(groups, membersLimit, pinned)` renders the first `MEMBERS_PAGE = 400` genes across genome groups, in server order (`genome_idx`). Selected genomes are always shown in full. "show more" adds another 400.
 - **The pattern section:** `loadPattern` lists the other OGs with the same pattern and has an "Order by pattern" button.
 
-Copy buttons copy the **raw** ID through one delegated handler.
+Copy buttons copy the **raw** ID through one delegated handler (`toasts().hint` on success, `toasts().error` on failure).
 
-### 7.9 The alignment view
+### 7.11 The alignment view
 
 `openAlignment(og)` pushes `#…&og=<OG>&view=aln` and calls `showAlignment`. `loadAlignment(og)` then:
 
 1. starts `alnGen` and clears the previous OG's content;
 2. loads the gene tree: from the cache, or as a cached "missing", or with `loadTree`;
 3. renders immediately with the cached MSA or a "loading alignment…" placeholder;
-4. fetches the MSA. A 503 shows **retry**.
+4. fetches the MSA. A 503 shows an in-view **retry** button **and** a notice toast with a **Retry** action.
 
 Every await re-checks `alnGen.isCurrent(my) && alnOg === og`.
 
@@ -1046,13 +1092,13 @@ Every await re-checks `alnGen.isCurrent(my) && alnOg === og`.
 
 Stepping (←/→ or the arrow buttons) calls `stepOg`. It finds the current OG's position in the current order with `positionOfOg`, which looks in `activeOgs` first and otherwise does a search for the ID. It then fetches the neighbouring position's ID and `replaceState`s the hash. On close, `restoreMatrix` restores the drawer if the view was opened from it. If the user stepped to another OG, it recentres the matrix on that OG with `jumpToOg`.
 
-### 7.10 URL hash state and routing
+### 7.12 URL hash state and routing
 
 `hashParams()` writes `order`, `cx` and `cy` (2 decimals), `zx` and `zy` (3 decimals), `mode`, `q` (if any) and the selection, which is `genome=<name>` or `rows=r0-r1` for a binned range. `updateHash()` adds `og=<OG>` when the drawer is open, or `og=<OG>&view=aln` in the alignment view.
 
 | Parameter | Meaning |
 | --- | --- |
-| `order` | Order name or dynamic ID. An unknown ID is added to the dropdown; if the server returns 404 it falls back to `tree` with a notice. |
+| `order` | Order name or dynamic ID. An unknown ID is added to the dropdown; if the server returns 404 it shows a notice toast and falls back to `tree`. |
 | `cx`, `cy`, `zx`, `zy` | The view. If present, the view is not refitted on resize (`fitted = false`). |
 | `mode` | `presence` or `copies`. |
 | `q` | Search query, restored and executed. |
@@ -1070,7 +1116,7 @@ Most updates use `history.replaceState`, debounced by 200 ms through `scheduleHa
 
 It always invalidates `navSeq`. Hand-edited `order`, view or `mode` values are not re-applied until reload.
 
-### 7.11 Keyboard handling
+### 7.13 Keyboard handling
 
 `onKeyDown` (on the document):
 
@@ -1079,7 +1125,7 @@ It always invalidates `navSeq`. Hand-edited `order`, view or `mode` values are n
 
 The search input handles its own Esc (clear) and Enter (run).
 
-### 7.12 The mock server
+### 7.14 The mock server
 
 `web/mock/server.ts` (`bun run mock`, port 8000, `--port N`) implements the API with a deterministic PRNG: 50 genomes in 5 clades and 2,000 OGs, plus annotations, metadata, MSAs, gene trees with duplications, and downloads. It also simulates edge cases:
 
@@ -1125,11 +1171,15 @@ Server tests use `fastapi.testclient.TestClient(create_app(dir))` on small datas
 
 ### 8.2 Frontend (`cd web && bun test`)
 
-There are 89 tests in 11 files. They exercise only pure modules; nothing needs a DOM except the small stubs in the tests.
+There are 135 tests in 15 files. They exercise only pure modules; nothing needs a DOM except the small stubs in the tests.
 
 | File | Covers |
 | --- | --- |
 | `transform.test.ts` | DPR backing size, transform round trip, bitmap ↔ label alignment, clamping and zoom limits, window and cap maths, `bufferAt`. |
+| `matrix.test.ts` | Tile activation fade (thresholds, smoothstep, monotonicity), gap/radius clamps, `tileParams` (flat when binned or small, scaled by DPR), `isShaderError`. |
+| `theme.test.ts` | Theme resolution (`auto` vs explicit, OS changes), `paletteFor`, the per-theme presence/copies endpoints and legends, categorical/residue palettes, and per-theme ramp luminance monotonicity. |
+| `toast.test.ts` | The toast queue (hint restart, max-3 eviction, sticky errors), error keying and the network collapse, pause/resume timing with the 1.5 s floor, helpers, and `NetworkError` classification. |
+| `requestkey.test.ts` | `requestKeys`/`needsFetch`: unchanged state fetches nothing, order/track keys change independently, and a cleared displayed state forces a refetch. |
 | `tracks.test.ts` | Strip hit testing (including stale spans), `binRange`. |
 | `v1.test.ts` | LE decoders, copies maths and saturation, the categorical palette, `hitViewport`. |
 | `pending.test.ts` | `PendingCache` sharing, `forget`, bounds. |

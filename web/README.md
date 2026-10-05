@@ -7,10 +7,12 @@ Vite + TypeScript + deck.gl frontend. It talks only to the API in `docs/api.md`.
 `src/` modules (plain TypeScript, no framework; deck.gl draws the heatmap, the rest is Canvas2D/DOM):
 
 - `main.ts` — wiring and UI state: boot, fetch lifecycle, render loop, interaction, URL hash, keyboard.
+- `theme.ts` — theme resolution (auto/light/dark), the light/dark palette, and the live theme store.
 - `transform.ts` — the shared world↔pixel transform and viewport math (zoom/clamp, window and cell
   maths, DPR canvas setup). Every matrix-aligned panel uses it.
-- `api.ts` — typed client for every endpoint.
-- `matrix.ts` — deck.gl `BitmapLayer` heatmap and the presence/copy-number colour maths.
+- `api.ts` — typed client for every endpoint, plus `HttpError`/`NetworkError`.
+- `matrix.ts` — deck.gl heatmap: colour maths, the `TiledBitmapLayer` rounded-cell shader and the
+  `Heatmap` with its flat fallback.
 - `tree.ts` — genome dendrogram on Canvas2D, clade selection and hit testing.
 - `tracks.ts` — track strips above the matrix (numeric bars, categorical colours).
 - `annotations.ts` — the categorical annotation palette.
@@ -19,6 +21,9 @@ Vite + TypeScript + deck.gl frontend. It talks only to the API in `docs/api.md`.
 - `selection.ts` — the selected-genome model and hash encoding.
 - `members.ts` — member-list pagination with pinned genomes.
 - `pending.ts`, `generation.ts` — the shared-promise cache and the stale-response guards.
+- `requestkey.ts` — request dedupe keys for the matrix window and its track layers.
+- `dropdown.ts` — position-fixed dropdowns anchored to a top-bar control.
+- `toast.ts` — the toast queue and container (hint/notice/error).
 - `alignment.ts` — the alignment view (row order, virtual band, renderer).
 - `msa.ts` — MSA column maths, residue colours, conservation.
 - `genetree.ts` — gene-tree layout, `treeNodeX`, leaf colours.

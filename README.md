@@ -29,7 +29,8 @@ uv run orthopan serve out
 
 ## Using the viewer
 
-- **Matrix:** genomes are rows (in genome tree order) and orthogroups are columns. The mouse wheel zooms orthogroups, Shift+wheel zooms genomes, and dragging pans.
+- **Matrix:** genomes are rows (in genome tree order) and orthogroups are columns. The mouse wheel zooms orthogroups, Shift+wheel zooms genomes, and dragging pans. At high zoom cells are drawn as rounded tiles; they stay flat when a row or column is binned.
+- **Theme:** the top-bar Theme control switches auto/light/dark. auto follows the OS preference, and the choice is remembered.
 - **Order:** sorts the orthogroups by tree position (default), frequency or any track. Select a clade in the tree and choose "sort by contrast" to bring that clade's genes to the front.
 - **Click a cell:** the drawer shows the orthogroup's members, with the clicked genome's genes at the top. **Open alignment view** shows the gene tree, gene names and MSA side by side.
 - **Keys:** ←/→ (and `[`/`]`) step to the previous or next orthogroup; Esc closes the current view.

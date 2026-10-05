@@ -100,3 +100,9 @@ Decisions taken so far (2026-10-04). See `VISION.md` for context and `docs/anvio
 - Both are precomputed at import as permutation columns. Per-orthogroup sort keys (frequency, MRCA node, purity, copy number, homogeneity) are stored as well.
 - On-demand sorts by any track and clade-contrast sorts ("present in selection, absent elsewhere") run on the server.
 - There is no full hierarchical clustering of orthogroups. 91% of orthogroups are rare accessory, and there are 26k unique patterns, so it costs too much memory for too little benefit.
+
+## Viewer presentation
+
+- **Dark mode.** The theme setting is `auto` | `light` | `dark`; `auto` follows `prefers-color-scheme`. The resolved theme drives a `data-theme` attribute whose CSS variables style the DOM, plus a matching TypeScript palette for the canvases and deck.gl. An inline `<head>` script applies the stored theme before first paint (no light flash), and switching themes redraws the current view without a refetch. Each theme's presence/numeric ramps are monotonic in luminance (light darkens as presence rises, dark brightens), so a value maps to one colour within a theme.
+- **Rounded matrix cells.** At full detail and about 6 CSS px per cell and above, cells are drawn as rounded tiles (`TiledBitmapLayer`, a custom deck.gl fragment shader); below that, and whenever either axis is binned, the flat rendering is used unchanged. If the shader fails to compile or link, the app permanently falls back to a plain bitmap (luma.gl reports this only through `console.error`, which an inline hook forwards to `window.__onShaderError`).
+- **Toasts.** Transient messages are bottom-centre toasts: `hint` 3 s, `notice` 6 s, `error` sticky until closed with collapsible details. At most 3 show at once, hovering pauses the countdown, and there are no keyboard shortcuts. Repeated hints restart in place; repeated errors (or any transport failure) collapse into one toast with a `×N` count.
