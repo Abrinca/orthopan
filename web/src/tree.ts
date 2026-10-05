@@ -12,7 +12,11 @@ export class Tree {
   private lo: number[] = [];
   private hi: number[] = [];
   private depth: number[] = [];
+  private edges: number[] = [];
   private maxDepth = 1;
+  private maxEdges = 1;
+  /** phylogram uses branch lengths; cladogram uses edge counts (always visible). */
+  mode: 'phylogram' | 'cladogram' = 'phylogram';
   selected: number | null = null;
 
   // cached mapping from the last draw, for hit testing
@@ -20,12 +24,17 @@ export class Tree {
 
   constructor(private canvas: HTMLCanvasElement) {}
 
+  setMode(mode: 'phylogram' | 'cladogram'): void {
+    this.mode = mode;
+  }
+
   async load(): Promise<void> {
     this.arrays = await getTree();
     const a = this.arrays;
     const n = a.parent.length;
     this.children = Array.from({length: n}, () => [] as number[]);
     this.depth = new Array<number>(n).fill(0);
+    this.edges = new Array<number>(n).fill(0);
     this.lo = new Array<number>(n).fill(0);
     this.hi = new Array<number>(n).fill(0);
     for (let i = 0; i < n; i++) {
@@ -35,6 +44,7 @@ export class Tree {
       if (p >= 0 && p < i) {
         this.children[p].push(i);
         this.depth[i] = this.depth[p] + (a.length[i] || 0);
+        this.edges[i] = this.edges[p] + 1;
       }
     }
     for (let i = n - 1; i >= 0; i--) {
@@ -47,6 +57,25 @@ export class Tree {
       }
     }
     this.maxDepth = Math.max(1e-9, ...this.depth);
+    this.maxEdges = Math.max(1, ...this.edges);
+  }
+
+  /**
+   * Edge depth is used when the requested mode is cladogram, or when branch
+   * lengths are degenerate (all zero / non-finite) so the topology stays visible.
+   */
+  private useEdges(): boolean {
+    return this.mode === 'cladogram' || !(this.maxDepth > 1e-6 && Number.isFinite(this.maxDepth));
+  }
+
+  /** X pixel of node i's branch end for the current mode. */
+  private xOfNode(i: number, pw: number): number {
+    const span = pw - 2 * PAD;
+    if (this.useEdges()) {
+      const e = this.children[i].length === 0 ? this.maxEdges : this.edges[i];
+      return PAD + (e / this.maxEdges) * span;
+    }
+    return PAD + ((this.depth[i] || 0) / this.maxDepth) * span;
   }
 
   /** Genome-row range covered by the selected node, inclusive. */
@@ -60,7 +89,7 @@ export class Tree {
     if (!ctx) return;
     if (!this.arrays) return;
 
-    const xOf = (d: number) => PAD + (d / this.maxDepth) * (pw - 2 * PAD);
+    const xOf = (i: number) => this.xOfNode(i, pw);
     const nodeY = (i: number) => tr.yOf((this.lo[i] + this.hi[i]) / 2 + 0.5);
     this.t = {xOf, nodeY};
     const a = this.arrays;
@@ -80,15 +109,15 @@ export class Tree {
     for (let i = 0; i < a.parent.length; i++) {
       const kids = this.children[i];
       if (kids.length) {
-        const x = xOf(this.depth[i]);
+        const x = xOf(i);
         ctx.moveTo(x, nodeY(kids[0]));
         ctx.lineTo(x, nodeY(kids[kids.length - 1]));
       }
       const p = a.parent[i];
       if (p >= 0 && p < i) {
         const y = nodeY(i);
-        ctx.moveTo(xOf(this.depth[p]), y);
-        ctx.lineTo(xOf(this.depth[i]), y);
+        ctx.moveTo(xOf(p), y);
+        ctx.lineTo(xOf(i), y);
       }
     }
     ctx.stroke();
@@ -105,8 +134,8 @@ export class Tree {
         const p = a.parent[i];
         if (p < 0 || p >= i) break;
         const y = nodeY(i);
-        ctx.moveTo(xOf(this.depth[p]), y);
-        ctx.lineTo(xOf(this.depth[i]), y);
+        ctx.moveTo(xOf(p), y);
+        ctx.lineTo(xOf(i), y);
         i = p;
       }
       ctx.stroke();
@@ -123,9 +152,9 @@ export class Tree {
     for (let i = 0; i < a.parent.length; i++) {
       const y = nodeY(i);
       const p = a.parent[i];
-      // The horizontal branch of node i runs from its parent's depth to its own.
-      const x0 = p >= 0 && p < i ? xOf(this.depth[p]) : xOf(this.depth[i]) - 6;
-      const x1 = xOf(this.depth[i]);
+      // The horizontal branch of node i runs from its parent's branch end to its own.
+      const x0 = p >= 0 && p < i ? xOf(p) : xOf(i) - 6;
+      const x1 = xOf(i);
       const d = segmentDistance(px, py, x0, y, x1, y);
       if (d < bestD) {
         bestD = d;

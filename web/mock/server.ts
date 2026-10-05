@@ -1,6 +1,6 @@
 // Synthetic OrthoPan API server for frontend development without the backend.
 // Implements docs/api.md on 50 genomes x 2000 orthogroups with clade structure.
-// Also serves web/dist so `bun run build` output can be checked headlessly.
+// Also serves src/orthopan/static so `bun run build` output can be checked headlessly.
 //
 //   bun run web/mock/server.ts            # port 8000, serves dist if present
 //   bun run web/mock/server.ts --port 9000
@@ -13,7 +13,7 @@ const N_G = 50;
 const N_OG = 2000;
 const CLADES = 5;
 const CLADE_SIZE = N_G / CLADES;
-const DIST = join(import.meta.dir, '..', 'dist');
+const DIST = join(import.meta.dir, '..', '..', 'src', 'orthopan', 'static');
 const MAX_CELLS = 4096;
 const MAX_CELLS_TOTAL = 4_000_000;
 const MAX_LIST = 5000;
@@ -602,12 +602,12 @@ function makeGeneTree(ogIdx: number) {
   return {orthogroup: `OG${String(ogIdx).padStart(7, '0')}`, parent, length, label, gene, genome_row: genomeRow, duplication, support};
 }
 
-function newickOf(tree: ReturnType<typeof makeGeneTree>, ids: 'display' | 'raw', ogIdx: number): string {
+function newickOf(tree: ReturnType<typeof makeGeneTree>, ids: 'display' | 'raw', genes: GeneRef[]): string {
   const children: number[][] = tree.parent.map(() => []);
   tree.parent.forEach((p, i) => {
     if (p >= 0) children[p].push(i);
   });
-  const genes = new Map(genesOf(ogIdx).map((g) => [g.gene, g]));
+  const byGene = new Map(genes.map((g) => [g.gene, g]));
   const name = (i: number) => {
     const leafGene = tree.gene[i];
     if (leafGene) return (ids === 'raw' ? genes.get(leafGene)?.raw : leafGene) ?? leafGene;
@@ -620,6 +620,86 @@ function newickOf(tree: ReturnType<typeof makeGeneTree>, ids: 'display' | 'raw',
     return `(${kids.map(rec).join(',')})${name(i)}${bl}`;
   };
   return rec(0) + ';';
+}
+
+// --- synthetic 2,000-row orthogroup (virtualisation stress test) ------------
+
+const BIG_OG_ID = 'OG0002000';
+const BIG_OG_ROWS = 2000;
+
+function bigGenes(): GeneRef[] {
+  const out: GeneRef[] = [];
+  for (let i = 0; i < BIG_OG_ROWS; i++) {
+    const r = i % N_G;
+    const raw = `gnl|extdb|${genomeNames[r]}_big_${String(i).padStart(6, '0')}`;
+    out.push({genome: genomeNames[r], row: r, gene: raw.replace(/^gnl\|[^|]+\|/, ''), raw});
+  }
+  return out;
+}
+
+function makeBigMsa() {
+  const genes = bigGenes();
+  const length = 240;
+  const rows = genes.map((g, gi) => {
+    let seq = '';
+    for (let c = 0; c < length; c++) {
+      const m = (c * 13 + gi * 5) % 23;
+      seq += m === 0 ? AMINO[(c * 3 + gi) % AMINO.length] : m === 1 ? '-' : AMINO[(c * 7 + (g.row % 7) * 3) % AMINO.length];
+    }
+    return {genome: g.genome, row: g.row, gene: g.gene, raw: g.raw, seq};
+  });
+  return {orthogroup: BIG_OG_ID, source: 'orthofinder' as const, length, trimmed: true, rows};
+}
+
+function makeBigTree() {
+  const genes = bigGenes();
+  const parent: number[] = [];
+  const length: number[] = [];
+  const label: string[] = [];
+  const gene: (string | null)[] = [];
+  const genomeRow: number[] = [];
+  const duplication: boolean[] = [];
+  const support: (number | null)[] = [];
+  let id = 0;
+  const build = (lo: number, hi: number, par: number): void => {
+    const my = id++;
+    parent[my] = par;
+    length[my] = 0.05 + ((my * 7) % 10) / 100;
+    support[my] = par < 0 ? null : Number((0.5 + (my % 5) / 10).toFixed(2));
+    if (hi - lo === 1) {
+      const g = genes[lo];
+      label[my] = g.gene;
+      gene[my] = g.gene;
+      genomeRow[my] = g.row;
+      duplication[my] = false;
+    } else {
+      label[my] = `n${my}`;
+      gene[my] = null;
+      genomeRow[my] = -1;
+      duplication[my] = my % 3 === 0;
+      const mid = Math.floor((lo + hi) / 2);
+      build(lo, mid, my);
+      build(mid, hi, my);
+    }
+  };
+  build(0, genes.length, -1);
+  return {orthogroup: BIG_OG_ID, parent, length, label, gene, genome_row: genomeRow, duplication, support};
+}
+
+function bigDetails(): Response {
+  return json({
+    orthogroup: BIG_OG_ID,
+    og_idx: 2000,
+    n_genomes: N_G,
+    n_genes: BIG_OG_ROWS,
+    mrca_label: 'root',
+    purity: 1,
+    tracks: {},
+    annotations: {description: 'synthetic 2,000-row orthogroup for virtualisation'},
+    pattern_id: 0,
+    n_same_pattern: 0,
+    members: [],
+  });
 }
 
 function download(content: string, filename: string): Response {
@@ -753,10 +833,24 @@ const server = Bun.serve({
       const rest = p.slice('/api/orthogroup/'.length);
       const suffix = ['/pattern', '/msa', '/gene-tree.nwk', '/gene-tree', '/fasta'].find((s) => rest.endsWith(s));
       const id = decodeURIComponent(suffix ? rest.slice(0, -suffix.length) : rest);
+      const ids: 'display' | 'raw' = q.get('ids') === 'raw' ? 'raw' : 'display';
+      if (id === BIG_OG_ID) {
+        if (suffix === '/msa') return json(makeBigMsa());
+        if (suffix === '/gene-tree') return json(makeBigTree());
+        if (suffix === '/gene-tree.nwk') return download(newickOf(makeBigTree(), ids, bigGenes()), `${BIG_OG_ID}.nwk`);
+        if (suffix === '/fasta') {
+          const aligned = q.get('aligned') === '1';
+          const rows = aligned ? makeBigMsa().rows : bigGenes().map((g) => ({...g, seq: ''}));
+          const body = rows
+            .map((r) => `>${ids === 'raw' ? (r as GeneRef).raw : (r as GeneRef).gene}\n${aligned ? (r as {seq: string}).seq : 'MKT'}`)
+            .join('\n');
+          return download(body + '\n', `${BIG_OG_ID}${aligned ? '.aligned' : ''}.fa`);
+        }
+        return bigDetails();
+      }
       const m = /^OG(\d+)$/.exec(id);
       if (!m || Number(m[1]) >= N_OG) return bad(404, `unknown orthogroup: ${id}`);
       const ogIdx = Number(m[1]);
-      const ids: 'display' | 'raw' = q.get('ids') === 'raw' ? 'raw' : 'display';
       if (suffix === '/msa') {
         if (!hasMsa(ogIdx)) return bad(404, 'no MSA for this orthogroup (no sequences available)');
         if (ogIdx === 1500 && (msaBusyAt.get(ogIdx) ?? 0) < Date.now() - 3000) {
@@ -772,7 +866,7 @@ const server = Bun.serve({
       }
       if (suffix === '/gene-tree.nwk') {
         if (!hasTree(ogIdx)) return bad(404, 'no gene tree for this orthogroup (<4 genes)');
-        return download(newickOf(makeGeneTree(ogIdx), ids, ogIdx), `OG${String(ogIdx).padStart(7, '0')}.nwk`);
+        return download(newickOf(makeGeneTree(ogIdx), ids, genesOf(ogIdx)), `OG${String(ogIdx).padStart(7, '0')}.nwk`);
       }
       if (suffix === '/fasta') {
         const aligned = q.get('aligned') === '1';

@@ -10,6 +10,9 @@ import {
   fitView,
   makeTransform,
   rowRange,
+  zoomedView,
+  zxRange,
+  zyRange,
   type View,
 } from '../src/transform';
 
@@ -179,5 +182,62 @@ describe('request cell cap', () => {
     const r = capCellCounts(4096, 4096);
     expect(r.w * r.h).toBeLessThanOrEqual(4_000_000);
     close(r.w / r.h, 1, 1);
+  });
+});
+
+describe('pointer-anchored zoom limits', () => {
+  const nOG = 1000;
+  const nG = 50;
+  const pw = 800;
+  const ph = 600;
+  // clampView forces these to the max/min zoom and a legal centre.
+  const atMax = clampView({cx: 400, cy: 20, zx: 99, zy: 99}, nOG, nG, pw, ph);
+  const atMin = clampView({cx: 500, cy: 25, zx: -99, zy: -99}, nOG, nG, pw, ph);
+
+  test('range helpers agree with clampView', () => {
+    close(atMax.zx, zxRange(nOG, pw).max);
+    close(atMin.zx, zxRange(nOG, pw).min);
+    close(atMax.zy, zyRange(nG, ph).max);
+    close(atMin.zy, zyRange(nG, ph).min);
+  });
+
+  test('zoom-in at max zoom does not move the centre (X)', () => {
+    for (const p of [0, 40, pw / 2, pw - 1]) {
+      const tr = makeTransform(atMax, pw, ph);
+      const out = zoomedView(atMax, nOG, nG, pw, ph, {x: true, w: tr.ogAt(p), p}, 2);
+      close(out.zx, atMax.zx);
+      close(out.cx, atMax.cx);
+      close(out.cy, atMax.cy);
+      close(out.zy, atMax.zy);
+    }
+  });
+
+  test('zoom-in at max zoom does not move the centre (Y)', () => {
+    for (const p of [0, 30, ph / 2, ph - 1]) {
+      const tr = makeTransform(atMax, pw, ph);
+      const out = zoomedView(atMax, nOG, nG, pw, ph, {x: false, w: tr.rowAt(p), p}, 3);
+      close(out.zy, atMax.zy);
+      close(out.cy, atMax.cy);
+    }
+  });
+
+  test('zoom-out at min zoom does not move the centre (X and Y)', () => {
+    const tr = makeTransform(atMin, pw, ph);
+    const x = zoomedView(atMin, nOG, nG, pw, ph, {x: true, w: tr.ogAt(20), p: 20}, 0.25);
+    close(x.zx, atMin.zx);
+    close(x.cx, atMin.cx);
+    const y = zoomedView(atMin, nOG, nG, pw, ph, {x: false, w: tr.rowAt(40), p: 40}, 0.25);
+    close(y.zy, atMin.zy);
+    close(y.cy, atMin.cy);
+  });
+
+  test('mid-scale zoom still anchors and moves', () => {
+    const v = clampView({cx: 500, cy: 25, zx: -1, zy: -1}, nOG, nG, pw, ph);
+    const tr = makeTransform(v, pw, ph);
+    const out = zoomedView(v, nOG, nG, pw, ph, {x: true, w: tr.ogAt(100), p: 100}, 2);
+    expect(out.zx).toBeGreaterThan(v.zx);
+    // the world point under the pointer stays put
+    const outTr = makeTransform(out, pw, ph);
+    close(outTr.xOf(tr.ogAt(100)), 100);
   });
 });

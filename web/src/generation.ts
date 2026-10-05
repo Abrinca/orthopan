@@ -32,3 +32,24 @@ export class Generation {
     this.ctl = null;
   }
 }
+
+/**
+ * A bare monotonic token for guarding async navigation (prev/next). Callers
+ * capture `current()` before awaiting and only apply the result if
+ * `isCurrent(token)` still holds; `invalidate()` on close/route/order changes.
+ */
+export class Sequence {
+  private n = 0;
+
+  current(): number {
+    return this.n;
+  }
+
+  invalidate(): number {
+    return ++this.n;
+  }
+
+  isCurrent(token: number): boolean {
+    return token === this.n;
+  }
+}

@@ -29,16 +29,61 @@ export const MAX_CELLS_TOTAL = 4_000_000;
 
 export const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
 
+/** Zoom (log2 scale) limits for the X axis at the given viewport/orthogroup count. */
+export function zxRange(nOG: number, pw: number): {min: number; max: number} {
+  return {
+    min: Math.max(Math.log2(pw / Math.max(1, nOG)), Math.log2(MIN_PIXELS_PER_UNIT)),
+    max: Math.log2(MAX_PIXELS_PER_UNIT),
+  };
+}
+
+/** Zoom (log2 scale) limits for the Y axis at the given viewport/genome count. */
+export function zyRange(nG: number, ph: number): {min: number; max: number} {
+  return {
+    min: Math.max(Math.log2(ph / Math.max(1, nG)), Math.log2(MIN_PIXELS_PER_UNIT)),
+    max: Math.log2(MAX_PIXELS_PER_UNIT),
+  };
+}
+
 export function clampView(v: View, nOG: number, nG: number, pw: number, ph: number): View {
-  const fitX = Math.log2(pw / Math.max(1, nOG));
-  const fitY = Math.log2(ph / Math.max(1, nG));
-  const zx = clamp(v.zx, Math.max(fitX, Math.log2(MIN_PIXELS_PER_UNIT)), Math.log2(MAX_PIXELS_PER_UNIT));
-  const zy = clamp(v.zy, Math.max(fitY, Math.log2(MIN_PIXELS_PER_UNIT)), Math.log2(MAX_PIXELS_PER_UNIT));
+  const xr = zxRange(nOG, pw);
+  const yr = zyRange(nG, ph);
+  const zx = clamp(v.zx, xr.min, xr.max);
+  const zy = clamp(v.zy, yr.min, yr.max);
   const halfW = pw / 2 / 2 ** zx;
   const halfH = ph / 2 / 2 ** zy;
   const cx = 2 * halfW >= nOG ? nOG / 2 : clamp(v.cx, halfW, nOG - halfW);
   const cy = 2 * halfH >= nG ? nG / 2 : clamp(v.cy, halfH, nG - halfH);
   return {cx, cy, zx, zy};
+}
+
+/**
+ * Pointer-anchored wheel zoom. The scale is clamped *before* the pan offset is
+ * derived, so at the min/max limit the effective factor is 1 and the view (and
+ * therefore the centre) is unchanged. Uses the same limits as `clampView`.
+ */
+export function zoomedView(
+  v: View,
+  nOG: number,
+  nG: number,
+  pw: number,
+  ph: number,
+  anchor: {x: boolean; w: number; p: number},
+  factor: number,
+): View {
+  const nv: View = {...v};
+  if (anchor.x) {
+    const r = zxRange(nOG, pw);
+    const z = clamp(v.zx + Math.log2(factor), r.min, r.max);
+    nv.zx = z;
+    nv.cx = anchor.w - (anchor.p - pw / 2) / 2 ** z;
+  } else {
+    const r = zyRange(nG, ph);
+    const z = clamp(v.zy + Math.log2(factor), r.min, r.max);
+    nv.zy = z;
+    nv.cy = anchor.w - (anchor.p - ph / 2) / 2 ** z;
+  }
+  return clampView(nv, nOG, nG, pw, ph);
 }
 
 export function fitView(nOG: number, nG: number, pw: number, ph: number): View {

@@ -21,17 +21,21 @@ import {
   type GeneTreeArrays,
   type MatrixResult,
   type Meta,
+  type MsaResult,
   type SearchHit,
   type TracksResult,
 } from './api';
 import {annotationCategory, categoryColor} from './annotations';
+import {AlignmentView, orderAlignmentRows, locateOg, stepPosition, type AlnContent, type AlnHover, type AlnBarHover} from './alignment';
 import {formatCopiesExact, formatCopiesMean} from './decode';
-import {GeneTreeView, MISSING_COLOR, type GeneTreeHover} from './genetree';
-import {Generation} from './generation';
+import {MISSING_COLOR} from './genetree';
+import {Generation, Sequence} from './generation';
 import {Heatmap, colorForValue, copiesLegend, toImageDataFor} from './matrix';
 import {Metadata, META_COL_W, numericColor} from './metadata';
-import {MsaView, type MsaHover} from './msa';
+import {computeConservation} from './msa';
+import {memberSlice, type MemberGroup} from './members';
 import {PendingCache} from './pending';
+import {decodeSelection, encodeSelection, rangeSelection, selectionNames, singleSelection, summarizeSelection, type GenomeSelection} from './selection';
 import {SearchBox, hitViewport} from './search';
 import {
   binRange,
@@ -44,6 +48,7 @@ import {
   makeTransform,
   prepareCanvas,
   rowRange,
+  zoomedView,
   type View,
   type Window,
 } from './transform';
@@ -64,24 +69,37 @@ const tooltip = $('tooltip');
 const panel = $('panel');
 const drawerTitle = $('drawer-title');
 const drawerClose = $<HTMLButtonElement>('drawer-close');
-const drawerExpand = $<HTMLButtonElement>('drawer-expand');
-const drawerResize = $('drawer-resize');
+const drawerPrev = $<HTMLButtonElement>('drawer-prev');
+const drawerNext = $<HTMLButtonElement>('drawer-next');
+const openAln = $<HTMLButtonElement>('open-aln');
 const idModeSelect = $<HTMLSelectElement>('id-mode');
 const dlFasta = $<HTMLAnchorElement>('dl-fasta');
 const dlAligned = $<HTMLAnchorElement>('dl-aligned');
 const dlNwk = $<HTMLAnchorElement>('dl-nwk');
 const tabMembers = $('tab-members');
-const msaCanvas = $<HTMLCanvasElement>('msa-canvas');
-const msaStatus = $('msa-status');
-const msaBadges = $('msa-badges');
-const msaRetry = $<HTMLButtonElement>('msa-retry');
-const geneTreeCanvas = $<HTMLCanvasElement>('tree-canvas');
-const treeFieldSelect = $<HTMLSelectElement>('tree-field');
-const treeModeSelect = $<HTMLSelectElement>('tree-mode');
-const treeLegend = $('tree-legend');
-const treeStatus = $('tree-status');
+// alignment view
+const alnView = $('aln-view');
+const alnScroll = $('aln-scroll');
+const alnRows = $('aln-rows');
+const alnCanvas = $<HTMLCanvasElement>('aln-canvas');
+const alnBar = $<HTMLCanvasElement>('aln-bar');
+const alnTitle = $('aln-title');
+const alnBadges = $('aln-badges');
+const alnStatusEl = $('aln-status');
+const alnLegend = $('aln-legend');
+const alnPrev = $<HTMLButtonElement>('aln-prev');
+const alnNext = $<HTMLButtonElement>('aln-next');
+const alnClose = $<HTMLButtonElement>('aln-close');
+const alnIdMode = $<HTMLSelectElement>('aln-id-mode');
+const alnField = $<HTMLSelectElement>('aln-field');
+const alnMode = $<HTMLSelectElement>('aln-mode');
+const alnRetry = $<HTMLButtonElement>('aln-retry');
+const alnDlFasta = $<HTMLAnchorElement>('aln-dl-fasta');
+const alnDlAligned = $<HTMLAnchorElement>('aln-dl-aligned');
+const alnDlNwk = $<HTMLAnchorElement>('aln-dl-nwk');
 const orderSelect = $<HTMLSelectElement>('order');
 const modeSelect = $<HTMLSelectElement>('mode');
+const treeShapeSelect = $<HTMLSelectElement>('tree-shape');
 const sortBtn = $<HTMLButtonElement>('sortbtn');
 const statusEl = $('status');
 const noticeEl = $('notice');
@@ -123,23 +141,36 @@ let hashTimer = 0;
 let hoverSeq = 0;
 let clickSeq = 0;
 
-// drawer state
+// detail drawer + alignment view state
 let currentOg: string | null = null;
-let currentTab: 'members' | 'msa' | 'gene-tree' = 'members';
-let highlightRow: number | null = null;
-let msaView: MsaView;
-let geneTreeView: GeneTreeView;
+let alignmentView: AlignmentView;
+let alnOpen = false;
+let alnOg: string | null = null;
+let alnStartOg: string | null = null;
+let alnFromDrawer = false;
 let treeField = '';
+
+// members pane: page in genes so huge OGs stay responsive
+const MEMBERS_PAGE = 400;
+let memberGroups: MemberGroup[] = [];
+let membersLimit = MEMBERS_PAGE;
+// genome selected by the matrix click (null when the drawer was opened without one)
+let selectedGenome: GenomeSelection | null = null;
 
 let activeOgs: {order: string; og0: number; ids: string[]} | null = null;
 const ogCache = new Map<string, string[]>();
 const ogAnnoCache = new PendingCache<Record<string, unknown>>(64);
 
-// drawer request lifecycle: one generation guards every pane; changing OG or
-// closing aborts all in-flight drawer requests and discards late responses.
+// drawer request lifecycle: one generation guards the members pane; the
+// alignment view has its own generation because it fetches MSA + tree.
 const drawerGen = new Generation();
 let drawerSignal: AbortSignal = new AbortController().signal;
-const drawerLoaded = {members: null as string | null, msa: null as string | null, tree: null as string | null};
+const alnGen = new Generation();
+let alnSignal: AbortSignal = new AbortController().signal;
+const msaCache = new Map<string, MsaResult>();
+// guards async prev/next lookups: invalidated on close, route and order changes
+const navSeq = new Sequence();
+let navChain: Promise<void> = Promise.resolve();
 const treeData = new Map<string, GeneTreeArrays>();
 const treeState = new Map<string, 'ok' | 'missing'>();
 const treeError = new Map<string, string>();
@@ -148,6 +179,12 @@ const treeInflight = new Map<string, Promise<GeneTreeArrays>>();
 function beginDrawer(): void {
   drawerSignal = drawerGen.begin().signal;
   treeInflight.clear(); // previous requests were aborted; never reuse them
+}
+
+function beginAlignment(): number {
+  alnSignal = alnGen.begin().signal;
+  treeInflight.clear();
+  return alnGen.current;
 }
 
 const TREE_CACHE_MAX = 16;
@@ -186,6 +223,22 @@ function fetchTreeData(og: string): Promise<GeneTreeArrays> {
   return p;
 }
 
+/** Alignment-view tree load: uses the alignment generation's signal and the
+ *  same caches as the drawer probe. A cached 404 throws immediately. */
+async function loadTree(og: string, signal: AbortSignal): Promise<GeneTreeArrays> {
+  const cached = treeData.get(og);
+  if (cached) return cached;
+  if (treeState.get(og) === 'missing') throw new Error(treeError.get(og) ?? 'no gene tree');
+  try {
+    const d = await getGeneTree(og, signal);
+    rememberTree(og, d);
+    return d;
+  } catch (err) {
+    if (err instanceof HttpError && err.status === 404) rememberTree(og, null, (err as Error).message);
+    throw err;
+  }
+}
+
 function dims(): {pw: number; ph: number} {
   return {pw: matrixWrap.clientWidth, ph: matrixWrap.clientHeight};
 }
@@ -211,9 +264,9 @@ async function boot(): Promise<void> {
   await tree.load();
   tracks = new Tracks(tracksCanvas);
   metadata = new Metadata(metaCanvas);
-  msaView = new MsaView(msaCanvas, onMsaHover);
-  geneTreeView = new GeneTreeView(geneTreeCanvas, onTreeHover, onLeafHover);
+  alignmentView = new AlignmentView(alnScroll, alnRows, alnCanvas, alnBar, onAlnHover, onAlnBarHover);
   setupDrawer();
+  setupAlignment();
 
   metaFields = meta.genome_metadata ?? [];
   const metaW = metaFields.length * META_COL_W;
@@ -274,8 +327,7 @@ function onDprChange(): void {
   watchDevicePixelRatio();
   heatmap?.resyncDpr();
   render();
-  msaView?.draw();
-  geneTreeView?.draw();
+  alignmentView?.draw();
 }
 
 function checkDevicePixelRatio(): void {
@@ -368,6 +420,7 @@ function setOrder(o: string): void {
   lastAnnoWorld = null;
   hover = null;
   hideTooltip();
+  navSeq.invalidate(); // in-flight prev/next must not apply after a reorder
   scheduleRender();
   scheduleHash();
   scheduleFetch();
@@ -623,14 +676,6 @@ function drawOverlay(tr: ReturnType<typeof makeTransform>, pw: number, ph: numbe
 
   drawCladeTint(ctx, tr, pw);
 
-  // gene-tree leaf hover highlights that genome's matrix row
-  if (highlightRow !== null) {
-    ctx.fillStyle = 'rgba(220,38,38,0.14)';
-    const y0 = tr.yOf(highlightRow);
-    const y1 = tr.yOf(highlightRow + 1);
-    ctx.fillRect(0, y0, pw, y1 - y0);
-  }
-
   // search-hit highlight
   if (highlight && performance.now() < highlight.until) {
     const x0 = tr.xOf(highlight.pos);
@@ -698,18 +743,10 @@ function bindInteractions(): void {
       const px = e.clientX - rect.left;
       const py = e.clientY - rect.top;
       const tr = makeTransform(view, pw, ph);
-      const wx = tr.ogAt(px);
-      const wy = tr.rowAt(py);
       const factor = 2 ** (-e.deltaY * 0.0015);
-      const nv: View = {...view};
-      if (e.shiftKey) {
-        nv.zy = view.zy + Math.log2(factor);
-        nv.cy = wy - (py - ph / 2) / 2 ** nv.zy;
-      } else {
-        nv.zx = view.zx + Math.log2(factor);
-        nv.cx = wx - (px - pw / 2) / 2 ** nv.zx;
-      }
-      view = clampView(nv, meta.n_orthogroups, meta.n_genomes, pw, ph);
+      view = e.shiftKey
+        ? zoomedView(view, meta.n_orthogroups, meta.n_genomes, pw, ph, {x: false, w: tr.rowAt(py), p: py}, factor)
+        : zoomedView(view, meta.n_orthogroups, meta.n_genomes, pw, ph, {x: true, w: tr.ogAt(px), p: px}, factor);
       heatmap.setView(view);
       afterViewChange();
     },
@@ -752,6 +789,11 @@ function bindInteractions(): void {
     syncMode();
     scheduleHash();
     scheduleFetch();
+  };
+
+  treeShapeSelect.onchange = () => {
+    tree.setMode(treeShapeSelect.value === 'cladogram' ? 'cladogram' : 'phylogram');
+    render();
   };
 
   sortBtn.onclick = () => void sortByContrast();
@@ -899,7 +941,7 @@ async function onClick(e: MouseEvent): Promise<void> {
   const tr = makeTransform(view, pw, ph);
   const hit = bufferAt(lastWin, tr, px, py, meta.n_genomes, meta.n_orthogroups);
   if (!hit) return;
-  if (hit.binnedX || hit.binnedY) {
+  if (hit.binnedX) {
     notice('zoom in until the cell covers a single orthogroup to open it');
     return;
   }
@@ -916,7 +958,18 @@ async function onClick(e: MouseEvent): Promise<void> {
     }
   }
   if (my !== clickSeq || !og) return;
-  openDrawer(og);
+  // The clicked row: a single genome, or a range when the row is binned.
+  let sel: GenomeSelection | null = null;
+  if (hit.binnedY) {
+    const [r0, r1] = rowRange(lastWin, hit.row);
+    const names: string[] = [];
+    for (let r = r0; r < r1 && r < meta.n_genomes; r++) if (genomes[r]) names.push(genomes[r].name);
+    if (names.length) sel = rangeSelection(names, [r0, r1]);
+  } else {
+    const g = genomes[hit.genome];
+    if (g) sel = singleSelection(g.name);
+  }
+  openDrawer(og, sel);
 }
 
 // --- search / jumps ---------------------------------------------------------
@@ -969,96 +1022,55 @@ async function orderByHits(q: string): Promise<void> {
 // --- detail drawer ----------------------------------------------------------
 
 function setupDrawer(): void {
-  document.querySelectorAll<HTMLButtonElement>('#panel .tab').forEach((b) => {
-    b.addEventListener('click', () => setDrawerTab(b.dataset.tab as DrawerTab));
-  });
   drawerClose.addEventListener('click', closeDrawer);
-  drawerExpand.addEventListener('click', () => {
-    panel.classList.toggle('expanded');
-    panel.style.width = '';
-    saveDrawerState();
-    msaView.draw();
-    geneTreeView.draw();
+  drawerPrev.addEventListener('click', () => void stepOg(-1));
+  drawerNext.addEventListener('click', () => void stepOg(1));
+  openAln.addEventListener('click', () => {
+    if (currentOg) openAlignment(currentOg);
   });
   idModeSelect.addEventListener('change', () => {
     updateDownloads();
     updateNwkLink();
   });
-  const fields = meta.genome_metadata ?? [];
-  treeFieldSelect.innerHTML =
-    '<option value="">genome identity</option>' +
-    fields.map((f) => `<option value="${esc(f.name)}">${esc(f.name)} (${esc(f.kind)})</option>`).join('');
-  const firstCat = fields.find((f) => f.kind === 'categorical');
-  treeField = firstCat ? firstCat.name : '';
-  treeFieldSelect.value = treeField;
-  renderTreeLegend();
-  treeFieldSelect.addEventListener('change', () => {
-    treeField = treeFieldSelect.value;
-    renderTreeLegend();
-    geneTreeView.setSpec(metaFields.find((f) => f.name === treeField));
+  document.addEventListener('keydown', onKeyDown);
+  window.addEventListener('popstate', onLocationChange);
+  window.addEventListener('hashchange', onLocationChange);
+  // one delegated handler for every copy button in the panel
+  tabMembers.addEventListener('click', (e) => {
+    const b = (e.target as HTMLElement | null)?.closest<HTMLButtonElement>('.copyid');
+    if (!b) return;
+    const id = b.dataset.id ?? '';
+    navigator.clipboard?.writeText(id).then(
+      () => notice(`copied ${id}`),
+      () => notice('copy failed'),
+    );
   });
-  treeModeSelect.addEventListener('change', () => {
-    geneTreeView.setMode(treeModeSelect.value as 'phylogram' | 'cladogram');
-  });
-  $('msa-zoom-in').addEventListener('click', () => msaView.zoomBy(1.5));
-  $('msa-zoom-out').addEventListener('click', () => msaView.zoomBy(1 / 1.5));
-  $('tree-zoom-in').addEventListener('click', () => geneTreeView.zoomBy(1.25));
-  $('tree-zoom-out').addEventListener('click', () => geneTreeView.zoomBy(1 / 1.25));
-  msaRetry.addEventListener('click', () => {
-    if (currentOg) void renderMsa(currentOg);
-  });
-  // restore persisted drawer width / expanded state
-  try {
-    const w = Number(localStorage.getItem('orthopan.drawerWidth'));
-    if (Number.isFinite(w) && w >= 300) panel.style.width = `${Math.min(window.innerWidth * 0.9, w)}px`;
-    if (localStorage.getItem('orthopan.drawerExpanded') === '1') panel.classList.add('expanded');
-  } catch {
-    /* storage unavailable */
-  }
-  // cheap horizontal resize of the drawer
-  drawerResize.addEventListener('pointerdown', (e) => {
-    e.preventDefault();
-    const startX = e.clientX;
-    const startW = panel.offsetWidth;
-    const move = (ev: PointerEvent) => {
-      panel.classList.remove('expanded');
-      panel.style.width = `${Math.max(300, Math.min(window.innerWidth * 0.9, startW + (startX - ev.clientX)))}px`;
-      msaView.draw();
-      geneTreeView.draw();
-    };
-    const up = () => {
-      saveDrawerState();
-      window.removeEventListener('pointermove', move);
-      window.removeEventListener('pointerup', up);
-    };
-    window.addEventListener('pointermove', move);
-    window.addEventListener('pointerup', up);
-  });
-  // Esc closes the drawer unless an input/select/textarea has focus
-  document.addEventListener('keydown', (e) => {
-    if (e.key !== 'Escape') return;
-    const tag = (document.activeElement as HTMLElement | null)?.tagName;
-    if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
-    if (panel.classList.contains('visible')) {
+}
+
+function onKeyDown(e: KeyboardEvent): void {
+  const tag = (document.activeElement as HTMLElement | null)?.tagName;
+  const typing = tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA';
+  if (e.key === 'Escape') {
+    if (typing) return;
+    if (alnOpen) {
+      e.preventDefault();
+      closeAlignment();
+    } else if (panel.classList.contains('visible')) {
       e.preventDefault();
       closeDrawer();
     }
-  });
-  // back button / hand-edited hash opens the OG and tab
-  window.addEventListener('hashchange', onHashChange);
-}
-
-function saveDrawerState(): void {
-  try {
-    localStorage.setItem('orthopan.drawerWidth', String(panel.offsetWidth));
-    localStorage.setItem('orthopan.drawerExpanded', panel.classList.contains('expanded') ? '1' : '0');
-  } catch {
-    /* storage unavailable */
+    return;
+  }
+  const prev = e.key === 'ArrowLeft' || e.key === '[';
+  const next = e.key === 'ArrowRight' || e.key === ']';
+  if ((prev || next) && !typing && (alnOpen || panel.classList.contains('visible'))) {
+    e.preventDefault();
+    void stepOg(prev ? -1 : 1);
   }
 }
 
-function renderTreeLegend(): void {
-  const spec = (meta?.genome_metadata ?? []).find((f) => f.name === treeField);
+function renderTreeLegend(el: HTMLElement, field: string): void {
+  const spec = (meta?.genome_metadata ?? []).find((f) => f.name === field);
   let html = '';
   if (!spec || spec.kind === 'categorical') {
     const cats = (spec?.categories ?? []).slice(0, 16);
@@ -1070,56 +1082,34 @@ function renderTreeLegend(): void {
     html = `<span class="lg">${fmt3(spec.min ?? 0)}${stops}${fmt3(spec.max ?? 1)}</span><span class="lg"><i style="background:${MISSING_COLOR}"></i>missing</span>`;
   }
   html += `<span class="lg"><i class="dup"></i>duplication</span>`;
-  treeLegend.innerHTML = html;
+  el.innerHTML = html;
 }
 
-type DrawerTab = 'members' | 'msa' | 'gene-tree';
-
-function openDrawer(og: string, tab?: DrawerTab): void {
+function openDrawer(og: string, genome: GenomeSelection | null = null): void {
+  selectedGenome = genome;
   const changed = og !== currentOg;
   if (changed) {
     beginDrawer();
-    drawerLoaded.members = drawerLoaded.msa = drawerLoaded.tree = null;
     clearDrawerPanes();
     currentOg = og;
     drawerTitle.textContent = og;
     updateDownloads();
     updateNwkLink();
     probeTree(og);
+    void renderMembers(og);
+  } else {
+    // same OG but a new genome selection: refresh just the members view
+    renderSelectionBlock();
+    renderMemberList();
   }
   panel.classList.add('visible');
-  setDrawerTab(tab ?? currentTab);
+  updateHash();
 }
 
 function clearDrawerPanes(): void {
   tabMembers.innerHTML = '';
-  msaView.setData(null);
-  msaStatus.textContent = '';
-  msaBadges.innerHTML = '';
-  msaRetry.hidden = true;
-  geneTreeView.setData(null, genomes, undefined);
-  treeStatus.textContent = '';
-  highlightRow = null;
   hideTooltip();
   renderOverlayNow();
-}
-
-function setDrawerTab(tab: DrawerTab): void {
-  currentTab = tab;
-  document.querySelectorAll<HTMLButtonElement>('#panel .tab').forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
-  document.querySelectorAll<HTMLElement>('#panel .tab-pane').forEach((p) => p.classList.toggle('active', p.id === `tab-${tab}`));
-  scheduleHash();
-  const og = currentOg;
-  if (!og) return;
-  if (tab === 'members') {
-    if (drawerLoaded.members !== og) void renderMembers(og);
-  } else if (tab === 'msa') {
-    if (drawerLoaded.msa !== og) void renderMsa(og);
-    else msaView.draw();
-  } else {
-    if (drawerLoaded.tree !== og) void renderGeneTree(og);
-    else geneTreeView.draw();
-  }
 }
 
 function updateDownloads(): void {
@@ -1128,16 +1118,22 @@ function updateDownloads(): void {
   dlFasta.href = fastaUrl(currentOg, false, ids);
   dlAligned.href = fastaUrl(currentOg, true, ids);
   dlNwk.href = geneTreeNwkUrl(currentOg, ids);
+  const aids = alnIdMode.value === 'raw' ? 'raw' : 'display';
+  alnDlFasta.href = fastaUrl(currentOg, false, aids);
+  alnDlAligned.href = fastaUrl(currentOg, true, aids);
+  alnDlNwk.href = geneTreeNwkUrl(currentOg, aids);
 }
 
-/** Enable/disable the Newick link from what we already know about the OG. */
+/** Enable/disable the Newick links from what we already know about the OG. */
 function updateNwkLink(): void {
   if (!currentOg) return;
   updateDownloads();
   const enabled = treeState.get(currentOg) !== 'missing';
-  dlNwk.classList.toggle('disabled', !enabled);
-  dlNwk.setAttribute('aria-disabled', enabled ? 'false' : 'true');
-  if (!enabled) dlNwk.removeAttribute('href');
+  for (const el of [dlNwk, alnDlNwk]) {
+    el.classList.toggle('disabled', !enabled);
+    el.setAttribute('aria-disabled', enabled ? 'false' : 'true');
+    if (!enabled) el.removeAttribute('href');
+  }
 }
 
 /** In the background, find out whether the OG has a gene tree so the Newick
@@ -1169,21 +1165,10 @@ async function renderMembers(og: string): Promise<void> {
     const annoRows = Object.entries(d.annotations ?? {})
       .map(([k, v]) => `<tr><td>${esc(k)}</td><td>${esc(fmtVal(v))}</td></tr>`)
       .join('');
-    const members = (d.members ?? [])
-      .map(
-        (m) =>
-          `<li class="genome-group"><b>${esc(m.genome)}</b><ul>` +
-          m.genes
-            .map(
-              (g) =>
-                `<li><code title="${esc(g.raw)}">${esc(g.id)}</code> ` +
-                `<button class="copyid" data-id="${esc(g.raw)}" title="copy raw id">copy</button></li>`,
-            )
-            .join('') +
-          `</ul></li>`,
-      )
-      .join('');
+    memberGroups = d.members ?? [];
+    membersLimit = MEMBERS_PAGE;
     tabMembers.innerHTML = `
+      <div id="sel-genome"></div>
       <table>
         <tr><td>og_idx</td><td>${d.og_idx}</td></tr>
         <tr><td>genomes</td><td>${d.n_genomes}</td></tr>
@@ -1194,19 +1179,11 @@ async function renderMembers(og: string): Promise<void> {
         ${annoRows}
         ${trackRows}
       </table>
-      <h2>member genomes (${d.members?.length ?? 0})</h2>
-      <ul class="genome-list">${members}</ul>
+      <h2>member genomes (${memberGroups.length})</h2>
+      <div id="members-list"></div>
       <div id="pattern-section"></div>`;
-    tabMembers.querySelectorAll<HTMLButtonElement>('.copyid').forEach((b) => {
-      b.addEventListener('click', () => {
-        const id = b.dataset.id ?? '';
-        navigator.clipboard?.writeText(id).then(
-          () => notice(`copied ${id}`),
-          () => notice('copy failed'),
-        );
-      });
-    });
-    drawerLoaded.members = og;
+    renderSelectionBlock();
+    renderMemberList();
     void loadPattern(d.orthogroup, my);
   } catch (err) {
     if (!drawerGen.isCurrent(my) || og !== currentOg) return;
@@ -1214,49 +1191,339 @@ async function renderMembers(og: string): Promise<void> {
   }
 }
 
-async function renderMsa(og: string): Promise<void> {
-  const my = drawerGen.current;
-  msaStatus.textContent = 'loading…';
-  msaBadges.innerHTML = '';
-  msaRetry.hidden = true;
-  try {
-    const d = await getMsa(og, drawerSignal);
-    if (!drawerGen.isCurrent(my) || og !== currentOg) return;
-    msaView.setData(d);
-    drawerLoaded.msa = og;
-    msaStatus.textContent = `${d.rows.length} rows × ${d.length} cols`;
-    msaBadges.innerHTML =
-      `<span class="badge src">${esc(d.source)}</span>` + (d.trimmed === true ? ' <span class="badge">trimmed</span>' : '');
-  } catch (err) {
-    if (!drawerGen.isCurrent(my) || og !== currentOg) return;
-    msaView.setData(null);
-    msaStatus.textContent = (err as Error).message;
-    if (err instanceof HttpError && err.status === 503) msaRetry.hidden = false;
+function geneListItem(gene: {id: string; raw: string}): string {
+  return (
+    `<li><code title="${esc(gene.raw)}">${esc(gene.id)}</code> ` +
+    `<button class="copyid" data-id="${esc(gene.raw)}" title="copy raw id">copy</button></li>`
+  );
+}
+
+/** The selected-genome block shown above the member list. */
+function renderSelectionBlock(): void {
+  const host = document.getElementById('sel-genome');
+  if (!host) return;
+  if (!selectedGenome) {
+    host.innerHTML = '';
+    return;
+  }
+  const sum = summarizeSelection(selectedGenome, memberGroups);
+  if (sum.absent) {
+    host.innerHTML = `<div class="sel-genome absent">absent in <b>${esc(sum.label)}</b></div>`;
+    return;
+  }
+  if (sum.binned) {
+    let html = `<div class="sel-genome"><b>${esc(sum.label)}</b> — ${sum.withGenes} of ${sum.selected} genomes have this OG`;
+    if (sum.tooMany) {
+      html += ` <span class="muted">(${sum.genes} genes · zoom in to see genes)</span></div>`;
+    } else {
+      html += ` <span class="muted">(${sum.genes} genes)</span>`;
+      html += `<ul class="genome-list">${sum.groups.map((g) => `<li class="genome-group"><b>${esc(g.genome)}</b><ul>${g.genes.map(geneListItem).join('')}</ul></li>`).join('')}</ul></div>`;
+    }
+    host.innerHTML = html;
+    return;
+  }
+  const group = sum.groups[0];
+  host.innerHTML =
+    `<div class="sel-genome"><b>In genome ${esc(sum.label)}</b>: ${sum.genes} ${sum.genes === 1 ? 'gene' : 'genes'}` +
+    (group ? `<ul>${group.genes.map(geneListItem).join('')}</ul>` : '') +
+    `</div>`;
+}
+
+/** Render only the first `membersLimit` genes so a 10k-member OG opens fast;
+ *  "show more" pages in the rest, keeping the genome grouping. */
+function renderMemberList(): void {
+  const host = document.getElementById('members-list');
+  if (!host) return;
+  const pinned = selectionNames(selectedGenome);
+  const {groups, shown, total} = memberSlice(memberGroups, membersLimit, pinned);
+  const parts = groups
+    .map(
+      (g) =>
+        `<li class="genome-group${pinned.has(g.genome) ? ' selected' : ''}"><b>${esc(g.genome)}</b>${g.hidden > 0 ? ` <span class="muted">(+${g.hidden})</span>` : ''}<ul>` +
+        g.genes.map(geneListItem).join('') +
+        `</ul></li>`,
+    )
+    .join('');
+  host.innerHTML =
+    `<ul class="genome-list">${parts}</ul>` +
+    (shown < total ? `<button id="members-more">show more (${total - shown} genes)</button>` : '');
+  const more = host.querySelector<HTMLButtonElement>('#members-more');
+  if (more) {
+    more.addEventListener('click', () => {
+      membersLimit += MEMBERS_PAGE;
+      renderMemberList();
+    });
   }
 }
 
-async function renderGeneTree(og: string): Promise<void> {
-  const my = drawerGen.current;
-  const spec = metaFields.find((f) => f.name === treeField);
-  if (treeState.get(og) === 'missing') {
-    geneTreeView.setData(null, genomes, spec);
-    treeStatus.textContent = treeError.get(og) ?? 'no gene tree for this orthogroup';
-    drawerLoaded.tree = og;
+// --- alignment view ---------------------------------------------------------
+
+const ALN_MSA_CACHE_MAX = 8;
+
+function setupAlignment(): void {
+  const fields = meta.genome_metadata ?? [];
+  alnField.innerHTML =
+    '<option value="">genome identity</option>' +
+    fields.map((f) => `<option value="${esc(f.name)}">${esc(f.name)} (${esc(f.kind)})</option>`).join('');
+  const firstCat = fields.find((f) => f.kind === 'categorical');
+  treeField = firstCat ? firstCat.name : '';
+  alnField.value = treeField;
+  renderTreeLegend(alnLegend, treeField);
+  alnField.addEventListener('change', () => {
+    treeField = alnField.value;
+    renderTreeLegend(alnLegend, treeField);
+    alignmentView.setSpec(specField());
+  });
+  alnMode.addEventListener('change', () => alignmentView.setMode(alnMode.value as 'phylogram' | 'cladogram'));
+  alnIdMode.addEventListener('change', () => {
+    alignmentView.setIdMode(alnIdMode.value === 'raw' ? 'raw' : 'display');
+    updateDownloads();
+    updateNwkLink();
+  });
+  alnPrev.addEventListener('click', () => void stepOg(-1));
+  alnNext.addEventListener('click', () => void stepOg(1));
+  alnClose.addEventListener('click', closeAlignment);
+  alnRetry.addEventListener('click', () => {
+    if (alnOg) void loadAlignment(alnOg);
+  });
+  const zin = document.getElementById('aln-zoom-in');
+  const zout = document.getElementById('aln-zoom-out');
+  zin?.addEventListener('click', () => alignmentView.zoomBy(1.5));
+  zout?.addEventListener('click', () => alignmentView.zoomBy(1 / 1.5));
+}
+
+function specField(): GenomeMetadataInfo | undefined {
+  return metaFields.find((f) => f.name === treeField);
+}
+
+function alnHash(og: string): string {
+  return `#${hashParams()}&og=${encodeURIComponent(og)}&view=aln`;
+}
+
+function showAlignment(og: string, fromDrawer: boolean, genome?: GenomeSelection | null): void {
+  if (genome !== undefined) selectedGenome = genome;
+  alnOpen = true;
+  alnOg = og;
+  alnStartOg = og;
+  alnFromDrawer = fromDrawer;
+  alnView.hidden = false;
+  alnView.classList.add('open');
+  alnTitle.textContent = og;
+  currentOg = og;
+  updateDownloads();
+  updateNwkLink();
+  void loadAlignment(og);
+}
+
+function openAlignment(og: string): void {
+  showAlignment(og, panel.classList.contains('visible'));
+  history.pushState(null, '', alnHash(og));
+}
+
+function hideAlignmentUI(): void {
+  alnOpen = false;
+  alnOg = null;
+  alnGen.abort();
+  navSeq.invalidate(); // a step in flight must not reopen the drawer
+  alnView.classList.remove('open');
+  alnView.hidden = true;
+  hideTooltip();
+}
+
+function closeAlignment(): void {
+  if (!alnOpen) return;
+  const og = alnOg;
+  const stepped = og !== alnStartOg;
+  const fromDrawer = alnFromDrawer;
+  hideAlignmentUI();
+  restoreMatrix(og, stepped, fromDrawer);
+}
+
+/** After leaving the alignment view: rebuild the drawer state and centre the
+ *  matrix on the last viewed OG when it changed. */
+function restoreMatrix(og: string | null, stepped: boolean, fromDrawer: boolean): void {
+  if (fromDrawer && og) {
+    currentOg = og;
+    drawerTitle.textContent = og;
+    updateDownloads();
+    updateNwkLink();
+    void renderMembers(og);
+  } else {
+    currentOg = null;
+  }
+  alnStartOg = null;
+  alnFromDrawer = false;
+  updateHash();
+  if (stepped && og) void jumpToOg(og);
+}
+
+function onLocationChange(): void {
+  navSeq.invalidate(); // a route change discards in-flight prev/next
+  const p = new URLSearchParams(location.hash.slice(1));
+  const og = p.get('og');
+  const view = p.get('view');
+  const sel = decodeSelection(p.get('genome'), p.get('rows'), genomes.map((g) => g.name));
+  if (view === 'aln' && og) {
+    const selChanged = encodeSelection(sel) !== encodeSelection(selectedGenome);
+    if (!alnOpen || alnOg !== og || selChanged) showAlignment(og, panel.classList.contains('visible'), sel);
     return;
   }
-  treeStatus.textContent = 'loading…';
+  if (alnOpen) {
+    const cur = alnOg;
+    // honour an explicit selection in the target hash (e.g. a hand-edited
+    // genome/rows); a genome-less Back keeps the current stepped selection
+    if (sel) selectedGenome = sel;
+    // On Back the hash still names the OG the view was opened from; when the
+    // hash was edited to another OG, honour that one instead.
+    const target = og && og !== alnStartOg ? og : cur;
+    hideAlignmentUI();
+    restoreMatrix(target, target !== alnStartOg, alnFromDrawer);
+    return;
+  }
+  if (og) {
+    // selection-only changes (same OG, different genome/rows) must apply too
+    if (og !== currentOg || encodeSelection(sel) !== encodeSelection(selectedGenome)) openDrawer(og, sel);
+  } else if (panel.classList.contains('visible')) closeDrawer();
+}
+
+async function positionOfOg(og: string): Promise<number | null> {
+  const pos = activeOgs && activeOgs.order === order ? locateOg(activeOgs.ids, activeOgs.og0, og) : null;
+  if (pos !== null) return pos;
   try {
-    const d = treeData.get(og) ?? (await fetchTreeData(og));
-    if (!drawerGen.isCurrent(my) || og !== currentOg) return;
-    geneTreeView.setData(d, genomes, spec);
-    treeStatus.textContent = `${d.parent.length} nodes`;
-    drawerLoaded.tree = og;
+    const res = await apiSearch(og, order, 5);
+    const hit = res.hits.find((h) => h.orthogroup === og) ?? res.hits[0];
+    return hit?.position ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** Enqueue a prev/next step so lookups never overlap. */
+function stepOg(delta: number): void {
+  const token = navSeq.current(); // captured at enqueue: a later close/route/order change cancels it
+  navChain = navChain.then(() => stepOgNow(delta, token)).catch(() => {
+    /* ignore */
+  });
+}
+
+async function stepOgNow(delta: number, token: number): Promise<void> {
+  if (!navSeq.isCurrent(token)) return;
+  const og = alnOpen ? alnOg : currentOg;
+  if (!og) return;
+  const pos = await positionOfOg(og);
+  if (!navSeq.isCurrent(token)) return; // closed / route or order changed
+  if (pos === null) return;
+  const next = stepPosition(pos, delta, meta.n_orthogroups);
+  if (next === null) return;
+  try {
+    const ids = await getOrthogroups(order, next, next + 1);
+    if (!navSeq.isCurrent(token)) return;
+    const id = ids[0];
+    if (!id) return;
+    if (alnOpen) {
+      alnOg = id;
+      currentOg = id;
+      alnTitle.textContent = id;
+      updateDownloads();
+      updateNwkLink();
+      history.replaceState(null, '', alnHash(id));
+      void loadAlignment(id);
+    } else {
+      openDrawer(id, selectedGenome);
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
+function badgeHtml(m: MsaResult): string {
+  return `<span class="badge src">${esc(m.source)}</span>` + (m.trimmed === true ? ' <span class="badge">trimmed</span>' : '');
+}
+
+function rememberMsa(og: string, m: MsaResult): void {
+  msaCache.delete(og);
+  msaCache.set(og, m);
+  while (msaCache.size > ALN_MSA_CACHE_MAX) {
+    const oldest = msaCache.keys().next().value as string | undefined;
+    if (oldest === undefined) break;
+    msaCache.delete(oldest);
+  }
+}
+
+async function loadAlignment(og: string): Promise<void> {
+  const my = beginAlignment();
+  alnStatusEl.textContent = 'loading…';
+  alnBadges.innerHTML = '';
+  alnRetry.hidden = true;
+  alnTitle.textContent = og;
+  // drop the previous OG's rows/hover immediately; the header shows "loading…"
+  if (alignmentView.contentOg !== og) alignmentView.clear();
+  const spec = specField();
+  alignmentView.setSpec(spec);
+  alignmentView.setIdMode(alnIdMode.value === 'raw' ? 'raw' : 'display');
+  alignmentView.setMode(alnMode.value as 'phylogram' | 'cladogram');
+
+  let tree: GeneTreeArrays | null = null;
+  let treeMessage: string | null = null;
+  if (treeState.get(og) === 'missing') {
+    treeMessage = treeError.get(og) ?? 'no gene tree (fewer than 4 genes)';
+  } else {
+    try {
+      tree = treeData.get(og) ?? (await loadTree(og, alnSignal));
+    } catch {
+      tree = null;
+      treeMessage = treeError.get(og) ?? null;
+    }
+  }
+  if (!alnGen.isCurrent(my) || alnOg !== og) return;
+  updateNwkLink();
+
+  const build = (msa: MsaResult | null, msg: string | null): AlnContent => {
+    const {rows, hasTree} = orderAlignmentRows(msa, tree);
+    const cons = msa ? computeConservation(msa.rows, msa.length) : {conservation: null, gap: null};
+    return {
+      og,
+      rows,
+      hasTree,
+      treeMessage,
+      msaLength: msa?.length ?? 0,
+      conservation: cons.conservation,
+      gap: cons.gap,
+      msaMessage: msg,
+      genomes,
+      spec,
+      idMode: alnIdMode.value === 'raw' ? 'raw' : 'display',
+      selectedGenomes: [...selectionNames(selectedGenome)],
+    };
+  };
+  const apply = (msa: MsaResult | null, msg: string | null): void => {
+    alignmentView.setTree(tree);
+    alignmentView.setData(build(msa, msg));
+  };
+
+  const cached = msaCache.get(og) ?? null;
+  apply(cached, cached ? null : 'loading alignment…');
+  if (cached) {
+    alnStatusEl.textContent = `${cached.rows.length} rows × ${cached.length} cols`;
+    alnBadges.innerHTML = badgeHtml(cached);
+    updateNwkLink();
+    return;
+  }
+
+  try {
+    const msa = await getMsa(og, alnSignal);
+    if (!alnGen.isCurrent(my) || alnOg !== og) return;
+    rememberMsa(og, msa);
+    apply(msa, null);
+    alnStatusEl.textContent = `${msa.rows.length} rows × ${msa.length} cols`;
+    alnBadges.innerHTML = badgeHtml(msa);
     updateNwkLink();
   } catch (err) {
-    if (!drawerGen.isCurrent(my) || og !== currentOg) return;
-    geneTreeView.setData(null, genomes, spec);
-    treeStatus.textContent = (err as Error).message;
-    if (treeState.get(og) === 'missing') updateNwkLink();
+    if (!alnGen.isCurrent(my) || alnOg !== og) return;
+    if ((err as Error).name === 'AbortError') return;
+    apply(null, (err as Error).message);
+    alnStatusEl.textContent = (err as Error).message;
+    if (err instanceof HttpError && err.status === 503) alnRetry.hidden = false;
   }
 }
 
@@ -1264,57 +1531,37 @@ function pct(x: number): string {
   return `${Math.round(x * 100)}%`;
 }
 
-function onMsaHover(h: MsaHover | null, clientX: number, clientY: number): void {
+function onAlnHover(h: AlnHover | null, clientX: number, clientY: number): void {
   if (!h) {
     hideTooltip();
     return;
   }
-  if (h.bar) {
-    tooltip.innerHTML = `col ${h.col + 1} · conservation ${pct(h.conservation)} · gap ${pct(h.gap)}`;
-    tooltip.style.display = 'block';
-    placeTooltip(clientX, clientY);
-    return;
-  }
-  tooltip.innerHTML =
-    `<b>${esc(h.gene)}</b> · <span class="tip-dim">${esc(h.genome)}</span><br>` +
-    `col ${h.col + 1} · ${esc(h.residue)}${h.ungapped > 0 ? ` · ungapped ${h.ungapped}` : ''}<br>` +
-    `conservation ${pct(h.conservation)} · gap ${pct(h.gap)}`;
+  const loc = h.col >= 0
+    ? `<br>col ${h.col + 1} · ${esc(h.residue || '-')}${h.ungapped > 0 ? ` · ungapped ${h.ungapped}` : ''}<br>conservation ${pct(h.conservation)} · gap ${pct(h.gap)}`
+    : '';
+  tooltip.innerHTML = `<b>${esc(h.gene || '—')}</b>${h.genome ? ` · <span class="tip-dim">${esc(h.genome)}</span>` : ''}${loc}`;
   tooltip.style.display = 'block';
   placeTooltip(clientX, clientY);
 }
 
-function onTreeHover(h: GeneTreeHover | null, clientX: number, clientY: number): void {
+function onAlnBarHover(h: AlnBarHover | null, clientX: number, clientY: number): void {
   if (!h) {
     hideTooltip();
     return;
   }
-  const gene = h.gene ?? 'internal node';
-  const support = h.support === null || h.support === undefined ? '' : ` · support ${h.support}`;
-  tooltip.innerHTML = `<b>${esc(gene)}</b>${h.genome ? ` · <span class="tip-dim">${esc(h.genome)}</span>` : ''}${h.duplication ? ' · <b>duplication</b>' : ''}${support}`;
+  tooltip.innerHTML = `col ${h.col + 1} · conservation ${pct(h.conservation)} · gap ${pct(h.gap)}`;
   tooltip.style.display = 'block';
   placeTooltip(clientX, clientY);
-}
-
-function onLeafHover(genomeRow: number | null): void {
-  highlightRow = genomeRow;
-  renderOverlayNow();
-}
-
-function onHashChange(): void {
-  const p = new URLSearchParams(location.hash.slice(1));
-  const og = p.get('og');
-  const tab = p.get('tab');
-  if (og && (tab === 'members' || tab === 'msa' || tab === 'gene-tree')) openDrawer(og, tab);
-  else if (!og && panel.classList.contains('visible')) closeDrawer();
 }
 
 function closeDrawer(): void {
   beginDrawer();
+  navSeq.invalidate(); // discard any in-flight prev/next
   panel.classList.remove('visible');
   currentOg = null;
-  drawerLoaded.members = drawerLoaded.msa = drawerLoaded.tree = null;
+  selectedGenome = null;
   clearDrawerPanes();
-  scheduleHash();
+  updateHash();
 }
 
 async function loadPattern(og: string, my: number): Promise<void> {
@@ -1376,21 +1623,28 @@ async function sortByContrast(): Promise<void> {
   }
 }
 
-// --- URL hash (order, viewport, mode, search) -------------------------------
+// --- URL hash (order, viewport, mode, search, drawer, alignment view) --------
 
 function scheduleHash(): void {
   window.clearTimeout(hashTimer);
   hashTimer = window.setTimeout(updateHash, 200);
 }
 
-function updateHash(): void {
+/** Shared matrix part of the hash (order, viewport, mode, search, selected genome). */
+function hashParams(): string {
   const q = searchBox?.query ?? '';
-  const drawer = currentOg ? `&og=${encodeURIComponent(currentOg)}&tab=${currentTab}` : '';
-  const h =
+  let h =
     `order=${encodeURIComponent(order)}&cx=${view.cx.toFixed(2)}&cy=${view.cy.toFixed(2)}` +
-    `&zx=${view.zx.toFixed(3)}&zy=${view.zy.toFixed(3)}&mode=${mode}` +
-    drawer +
-    (q ? `&q=${encodeURIComponent(q)}` : '');
+    `&zx=${view.zx.toFixed(3)}&zy=${view.zy.toFixed(3)}&mode=${mode}`;
+  if (q) h += `&q=${encodeURIComponent(q)}`;
+  h += encodeSelection(selectedGenome);
+  return h;
+}
+
+function updateHash(): void {
+  let h = hashParams();
+  if (alnOpen && alnOg) h += `&og=${encodeURIComponent(alnOg)}&view=aln`;
+  else if (currentOg && panel.classList.contains('visible')) h += `&og=${encodeURIComponent(currentOg)}`;
   history.replaceState(null, '', `#${h}`);
 }
 
@@ -1419,8 +1673,10 @@ function applyHash(): void {
   const q = p.get('q');
   if (q) searchBox.setQuery(q);
   const og = p.get('og');
-  const tab = p.get('tab');
-  if (og && (tab === 'members' || tab === 'msa' || tab === 'gene-tree')) openDrawer(og, tab);
+  const view_ = p.get('view');
+  const sel = decodeSelection(p.get('genome'), p.get('rows'), genomes.map((g) => g.name));
+  if (og && view_ === 'aln') showAlignment(og, panel.classList.contains('visible'), sel);
+  else if (og) openDrawer(og, sel);
 }
 
 boot().catch((err) => {

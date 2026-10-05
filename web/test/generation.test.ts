@@ -1,5 +1,5 @@
 import {describe, expect, test} from 'bun:test';
-import {Generation} from '../src/generation';
+import {Generation, Sequence} from '../src/generation';
 
 describe('drawer generation / abort', () => {
   test('begin() increments and aborts the previous requests', () => {
@@ -23,5 +23,29 @@ describe('drawer generation / abort', () => {
     g.abort();
     expect(a.signal.aborted).toBe(true);
     expect(g.current).toBe(1);
+  });
+});
+
+describe('navigation sequence', () => {
+  test('a token is only current until the next invalidation', () => {
+    const s = new Sequence();
+    const a = s.current();
+    expect(s.isCurrent(a)).toBe(true);
+    const b = s.invalidate();
+    expect(b).not.toBe(a);
+    expect(s.isCurrent(a)).toBe(false); // late prev/next result discarded
+    expect(s.isCurrent(b)).toBe(true);
+  });
+
+  test('invalidating on close discards an in-flight step', () => {
+    const s = new Sequence();
+    let applied = false;
+    const token = s.current();
+    const finish = () => {
+      if (s.isCurrent(token)) applied = true;
+    };
+    s.invalidate(); // closeDrawer()
+    finish();
+    expect(applied).toBe(false);
   });
 });

@@ -3,11 +3,9 @@ import type {MsaRow} from '../src/api';
 import {
   clampPxPerCol,
   clampScrollCol,
-  clampScrollY,
   computeConservation,
   fitPxPerCol,
   GAP_COLOR,
-  layoutMsaRows,
   LETTER_PX,
   MAX_PX_PER_COL,
   MIN_PX_PER_COL,
@@ -41,12 +39,6 @@ describe('MSA column math', () => {
     expect(clampScrollCol(-5, 100, 10, 50)).toBe(0);
     expect(clampScrollCol(100, 100, 10, 50)).toBe(40);
     expect(clampScrollCol(10, 1000, 10, 50)).toBe(0); // viewport wider than content
-  });
-
-  test('vertical scroll clamps to [0, contentH - viewH]', () => {
-    expect(clampScrollY(-3, 1000, 500)).toBe(0);
-    expect(clampScrollY(800, 1000, 500)).toBe(500);
-    expect(clampScrollY(100, 400, 600)).toBe(0); // content shorter than viewport
   });
 
   test('off-centre pointer-anchored zoom keeps the anchor pixel offset', () => {
@@ -112,25 +104,5 @@ describe('MSA residue colours', () => {
     expect(new Set([hydro, acid, basic, polar, other]).size).toBe(5);
     expect(residueColor('-')).toBe(GAP_COLOR);
     expect(residueColor('a')).toBe(hydro); // case-insensitive
-  });
-});
-
-describe('MSA row layout', () => {
-  const rows: MsaRow[] = [
-    {genome: 'g0', row: 0, gene: 'a', raw: 'a', seq: 'AA'},
-    {genome: 'g0', row: 0, gene: 'b', raw: 'b', seq: 'AB'},
-    {genome: 'g1', row: 1, gene: 'c', raw: 'c', seq: 'AC'},
-  ];
-  test('groups rows by genome and stacks group headers', () => {
-    const l = layoutMsaRows(rows, 15, 22);
-    expect(l.groups.length).toBe(2);
-    expect(l.groups[0].rowStart).toBe(0);
-    expect(l.groups[0].rowEnd).toBe(2);
-    expect(l.groups[1].rowStart).toBe(2);
-    expect(l.groups[1].rowEnd).toBe(3);
-    expect(l.ys[0]).toBe(22); // first row below its group header
-    expect(l.ys[1]).toBe(37);
-    expect(l.ys[2]).toBe(22 + 2 * 15 + 22); // second group header
-    expect(l.totalHeight).toBe(22 + 2 * 15 + 22 + 15);
   });
 });

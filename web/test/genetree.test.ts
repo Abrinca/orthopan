@@ -2,7 +2,7 @@ import {describe, expect, test} from 'bun:test';
 import type {GeneTreeArrays, Genome} from '../src/api';
 import {categoryColor} from '../src/annotations';
 import {numericColor} from '../src/metadata';
-import {layoutGeneTree, leafColor, fitTreeScale, hideLeafLabels, treeNodeX, MIN_TREE_ROW, HIDE_LABEL_ROW, MISSING_COLOR} from '../src/genetree';
+import {layoutGeneTree, leafColor, MISSING_COLOR, treeNodeX} from '../src/genetree';
 
 const arrays: GeneTreeArrays = {
   orthogroup: 'OG1',
@@ -47,19 +47,6 @@ describe('gene-tree array layout', () => {
 });
 
 describe('gene-tree view helpers', () => {
-  test('fit-to-height keeps every leaf visible, with a minimum row height', () => {
-    // 13 leaves in 700 px: fits at full 15 px rows
-    expect(fitTreeScale(13, 700)).toBe(1);
-    // huge tree: clamp so rows are at least MIN_TREE_ROW px, then scroll
-    const s = fitTreeScale(1000, 700);
-    expect(15 * s).toBeGreaterThanOrEqual(MIN_TREE_ROW - 1e-9);
-  });
-
-  test('leaf labels hide below the threshold', () => {
-    expect(hideLeafLabels(HIDE_LABEL_ROW - 0.01)).toBe(true);
-    expect(hideLeafLabels(HIDE_LABEL_ROW)).toBe(false);
-  });
-
   test('cladogram aligns all tips at the right edge', () => {
     const width = 300;
     const pad = 10;

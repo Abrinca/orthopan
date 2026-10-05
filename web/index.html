@@ -76,7 +76,7 @@
       #matrix-wrap { position: relative; flex: 1; min-height: 0; overflow: hidden; }
       #deck { position: absolute; inset: 0; }
       #overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
-      #tooltip { position: fixed; pointer-events: none; display: none; z-index: 40;
+      #tooltip { position: fixed; pointer-events: none; display: none; z-index: 70;
         background: rgba(17,24,39,0.92); color: #f9fafb; padding: 5px 7px; border-radius: 4px;
         font-size: 11px; max-width: 340px; white-space: nowrap; }
       #tooltip b { color: #93c5fd; font-weight: 600; }
@@ -89,13 +89,11 @@
         width: 100%; height: calc(100% - var(--track-h)); }
       #labels-spacer { height: var(--track-h); border-bottom: 1px solid var(--border); }
 
-      /* wide detail drawer overlaying the matrix; the label column stays visible */
-      #panel { position: absolute; top: 0; right: var(--label-w); bottom: 0; width: 380px;
+      /* detail drawer overlaying the matrix; the label column stays visible */
+      #panel { position: absolute; top: 0; right: var(--label-w); bottom: 0; width: 400px;
         background: #fff; border-left: 1px solid var(--border); box-shadow: -4px 0 12px rgba(0,0,0,0.08);
         display: none; z-index: 20; flex-direction: column; min-width: 300px; }
       #panel.visible { display: flex; }
-      #panel.expanded { width: 62%; }
-      #drawer-resize { position: absolute; left: -5px; top: 0; bottom: 0; width: 10px; cursor: ew-resize; }
       .drawer-head { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; padding: 6px 8px; border-bottom: 1px solid var(--border); }
       .drawer-head #drawer-title { font-weight: 600; font-size: 13px; min-width: 0; max-width: 100%; overflow: hidden;
         text-overflow: ellipsis; white-space: nowrap; }
@@ -104,13 +102,10 @@
       .drawer-head a.dl { text-decoration: none; color: #2563eb; border: 1px solid var(--border); border-radius: 3px; white-space: nowrap; }
       .drawer-head a.dl.disabled { color: #98a2b3; border-color: #e4e7ec; pointer-events: none; }
       .drawer-head .close { border: none; background: none; font-size: 16px; cursor: pointer; }
-      .tabs { display: flex; gap: 4px; padding: 4px 8px 0; border-bottom: 1px solid var(--border); }
-      .tab { border: 1px solid transparent; background: none; padding: 4px 10px; cursor: pointer; color: #475467; }
-      .tab.active { color: #111827; border-color: var(--border); border-bottom-color: #fff; border-radius: 4px 4px 0 0; }
-      .tab-pane { display: none; flex: 1; min-height: 0; }
-      .tab-pane.active { display: flex; flex-direction: column; }
-      #tab-members { overflow: auto; padding: 10px 12px; display: none; }
-      #tab-members.active { display: block; }
+      .navbtn { font: inherit; padding: 1px 6px; cursor: pointer; }
+      .drawer-actions { padding: 8px 10px; border-bottom: 1px solid var(--border); }
+      #open-aln { font: inherit; padding: 6px 10px; background: #2563eb; color: #fff; border: none; border-radius: 4px; cursor: pointer; }
+      #tab-members { overflow: auto; padding: 10px 12px; flex: 1; min-height: 0; }
       #panel h2 { font-size: 13px; margin: 10px 0 6px; }
       #panel h2:first-child { margin-top: 0; }
       #panel table { border-collapse: collapse; width: 100%; margin: 6px 0; }
@@ -120,10 +115,6 @@
       #panel code { background: #f2f4f7; padding: 0 3px; border-radius: 3px; }
       #panel .linkish { color: #2563eb; cursor: pointer; }
       #panel .linkish:hover { text-decoration: underline; }
-      .pane-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; padding: 4px 8px; border-bottom: 1px solid #eef2f6; }
-      .pane-toolbar .spacer { flex: 1; }
-      .pane-toolbar .badge { font-size: 10px; padding: 1px 5px; border-radius: 8px; background: #fef0c7; color: #b54708; }
-      .pane-toolbar .badge.src { background: #eef2f6; color: #475467; }
       .tree-legend { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 2px 8px; font-size: 10px; color: #475467; }
       .tree-legend .lg { display: inline-flex; align-items: center; gap: 3px; white-space: nowrap; }
       .tree-legend .lg i { display: inline-block; width: 9px; height: 9px; border: 1px solid rgba(0,0,0,0.2); border-radius: 1px; }
@@ -134,8 +125,29 @@
       #panel .genome-group ul { padding-left: 16px; }
       #panel .copyid { font-size: 10px; padding: 0 4px; margin-left: 4px; cursor: pointer; }
       #panel .muted { color: #667085; }
-      .canvas-wrap { position: relative; flex: 1; min-height: 0; }
-      .canvas-wrap canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+      #panel .sel-genome { background: #fffbeb; border: 1px solid #fde68a; border-radius: 4px;
+        padding: 6px 8px; margin: 0 0 8px; }
+      #panel .sel-genome.absent { background: #f8fafc; border-color: #e4e7ec; color: #667085; }
+      #panel .sel-genome ul { margin: 4px 0 0; padding-left: 16px; }
+      #panel .genome-group.selected { background: #eff4ff; border-radius: 3px; }
+
+      /* full-screen alignment view (tree | colour | gene | MSA) */
+      #aln-view { position: fixed; inset: 0; z-index: 60; background: #fff; display: none; flex-direction: column; }
+      #aln-view.open { display: flex; }
+      #aln-header { flex: 0 0 auto; border-bottom: 1px solid var(--border); background: #fff; }
+      .aln-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; padding: 4px 8px; }
+      .aln-controls label { color: #475467; }
+      .aln-controls button, .aln-controls select, .aln-controls a.dl { font: inherit; padding: 2px 6px; }
+      .aln-controls a.dl { text-decoration: none; color: #2563eb; border: 1px solid var(--border); border-radius: 3px; white-space: nowrap; }
+      .aln-controls a.dl.disabled { color: #98a2b3; border-color: #e4e7ec; pointer-events: none; }
+      #aln-badges .badge { font-size: 10px; padding: 1px 5px; border-radius: 8px; background: #fef0c7; color: #b54708; }
+      #aln-badges .badge.src { background: #eef2f6; color: #475467; }
+      #aln-status { color: #667085; }
+      #aln-legend { margin: 2px 8px; }
+      #aln-bar { display: block; width: 100%; height: 38px; }
+      #aln-scroll { flex: 1; min-height: 0; overflow-y: auto; position: relative; background: #fff; }
+      #aln-rows { position: relative; }
+      #aln-canvas { position: sticky; top: 0; display: block; width: 100%; }
     </style>
   </head>
   <body>
@@ -149,6 +161,11 @@
         <select id="mode">
           <option value="presence">presence</option>
           <option value="copies">copies</option>
+        </select>
+        <label for="tree-shape">Tree</label>
+        <select id="tree-shape" title="Genome tree drawing: branch lengths or topology">
+          <option value="phylogram">phylogram</option>
+          <option value="cladogram">cladogram</option>
         </select>
         <span id="legend" title="Cell colour scale"></span>
         <span id="search-wrap">
@@ -182,52 +199,54 @@
           <canvas id="labels"></canvas>
         </div>
         <div id="panel">
-          <div id="drawer-resize"></div>
           <div class="drawer-head">
+            <button id="drawer-prev" class="navbtn" title="previous orthogroup (←)">‹</button>
+            <button id="drawer-next" class="navbtn" title="next orthogroup (→)">›</button>
             <span id="drawer-title">orthogroup</span>
             <span class="grow"></span>
             <label>IDs <select id="id-mode"><option value="display">display</option><option value="raw">raw</option></select></label>
             <a id="dl-fasta" class="dl" download>FASTA</a>
             <a id="dl-aligned" class="dl" download>aligned</a>
             <a id="dl-nwk" class="dl" download>Newick</a>
-            <button id="drawer-expand" title="expand / collapse">⤢</button>
             <button id="drawer-close" class="close" aria-label="close">×</button>
           </div>
-          <div class="tabs">
-            <button class="tab active" data-tab="members">Members</button>
-            <button class="tab" data-tab="msa">MSA</button>
-            <button class="tab" data-tab="gene-tree">Gene tree</button>
+          <div class="drawer-actions">
+            <button id="open-aln">Open alignment view</button>
           </div>
-          <div id="tab-members" class="tab-pane active"></div>
-          <div id="tab-msa" class="tab-pane">
-            <div class="pane-toolbar">
-              <span id="msa-status"></span>
-              <span class="spacer"></span>
-              <span id="msa-badges"></span>
-              <button id="msa-retry" hidden>retry</button>
-              <button id="msa-zoom-out" title="zoom out">−</button>
-              <button id="msa-zoom-in" title="zoom in">+</button>
-            </div>
-            <div class="canvas-wrap"><canvas id="msa-canvas"></canvas></div>
-          </div>
-          <div id="tab-gene-tree" class="tab-pane">
-            <div class="pane-toolbar">
-              <label>Colour <select id="tree-field"></select></label>
-              <label>Layout
-                <select id="tree-mode">
-                  <option value="phylogram">phylogram</option>
-                  <option value="cladogram">cladogram</option>
-                </select>
-              </label>
-              <span id="tree-status"></span>
-              <span class="spacer"></span>
-              <button id="tree-zoom-out" title="zoom out">−</button>
-              <button id="tree-zoom-in" title="zoom in">+</button>
-              <span id="tree-legend" class="tree-legend"></span>
-            </div>
-            <div class="canvas-wrap"><canvas id="tree-canvas"></canvas></div>
-          </div>
+          <div id="tab-members"></div>
         </div>
+      </div>
+    </div>
+    <div id="aln-view" hidden>
+      <div id="aln-header">
+        <div class="aln-controls">
+          <button id="aln-prev" class="navbtn" title="previous orthogroup (←)">‹</button>
+          <button id="aln-next" class="navbtn" title="next orthogroup (→)">›</button>
+          <b id="aln-title">orthogroup</b>
+          <span id="aln-badges"></span>
+          <span id="aln-status"></span>
+          <span class="grow" style="flex:1"></span>
+          <label>IDs <select id="aln-id-mode"><option value="display">display</option><option value="raw">raw</option></select></label>
+          <a id="aln-dl-fasta" class="dl" download>FASTA</a>
+          <a id="aln-dl-aligned" class="dl" download>aligned</a>
+          <a id="aln-dl-nwk" class="dl" download>Newick</a>
+          <label>Colour <select id="aln-field"></select></label>
+          <label>Layout
+            <select id="aln-mode">
+              <option value="phylogram">phylogram</option>
+              <option value="cladogram">cladogram</option>
+            </select>
+          </label>
+          <button id="aln-zoom-out" title="zoom out">−</button>
+          <button id="aln-zoom-in" title="zoom in">+</button>
+          <button id="aln-retry" hidden>retry</button>
+          <button id="aln-close" class="close" aria-label="back to matrix">×</button>
+        </div>
+        <div id="aln-legend" class="tree-legend"></div>
+        <canvas id="aln-bar"></canvas>
+      </div>
+      <div id="aln-scroll">
+        <div id="aln-rows"><canvas id="aln-canvas"></canvas></div>
       </div>
     </div>
     <script type="module" src="/src/main.ts"></script>
