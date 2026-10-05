@@ -1,6 +1,8 @@
 // Genome dendrogram (rectangular cladogram) on a Canvas2D aligned with matrix rows.
 
 import {getTree, type TreeArrays} from './api';
+import type {Theme} from './theme';
+import {paletteFor} from './theme';
 import {prepareCanvas, type Transform} from './transform';
 
 const PAD = 8;
@@ -84,10 +86,11 @@ export class Tree {
     return [this.lo[this.selected], this.hi[this.selected]];
   }
 
-  draw(tr: Transform, pw: number, ph: number): void {
+  draw(tr: Transform, pw: number, ph: number, theme: Theme = 'light'): void {
     const ctx = prepareCanvas(this.canvas, pw, ph);
     if (!ctx) return;
     if (!this.arrays) return;
+    const pal = paletteFor(theme);
 
     const xOf = (i: number) => this.xOfNode(i, pw);
     const nodeY = (i: number) => tr.yOf((this.lo[i] + this.hi[i]) / 2 + 0.5);
@@ -97,14 +100,14 @@ export class Tree {
     // selected clade highlight
     const range = this.selectedRange;
     if (range) {
-      ctx.fillStyle = 'rgba(37,99,235,0.12)';
+      ctx.fillStyle = pal.cladeTint;
       const y0 = tr.yOf(range[0]);
       const y1 = tr.yOf(range[1] + 1);
       ctx.fillRect(0, y0, pw, y1 - y0);
     }
 
     ctx.lineWidth = 1;
-    ctx.strokeStyle = this.selected !== null ? '#334155' : '#475569';
+    ctx.strokeStyle = this.selected !== null ? pal.treeLineSelected : pal.treeLine;
     ctx.beginPath();
     for (let i = 0; i < a.parent.length; i++) {
       const kids = this.children[i];
@@ -124,7 +127,7 @@ export class Tree {
 
     // selected path in accent colour (cycle-guarded)
     if (this.selected !== null) {
-      ctx.strokeStyle = '#2563eb';
+      ctx.strokeStyle = pal.treePath;
       ctx.lineWidth = 1.6;
       ctx.beginPath();
       const seen = new Set<number>();

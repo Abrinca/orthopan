@@ -3,6 +3,7 @@
 
 import {search as apiSearch, type SearchHit} from './api';
 import type {View} from './transform';
+import {placeDropdown, trackDropdown} from './dropdown';
 
 /**
  * View state that centres orthogroup position `pos` on the X axis at a column
@@ -30,6 +31,8 @@ export class SearchBox {
   private controller: AbortController | null = null;
 
   constructor(private o: SearchBoxOptions) {
+    const bar = o.input.closest('#topbar');
+    if (bar) trackDropdown(o.input, o.results, bar, () => o.results.classList.contains('visible'));
     o.input.addEventListener('input', () => {
       this.invalidate(); // query changed: abort in-flight, hide stale results
       this.schedule();
@@ -115,6 +118,8 @@ export class SearchBox {
       .join('');
     this.o.results.innerHTML = `<div class="total">${total} hit${total === 1 ? '' : 's'}</div><ul>${items || '<li class="empty">no hits</li>'}</ul>`;
     this.o.results.classList.add('visible');
+    // the top bar scrolls horizontally, so pin the dropdown to the viewport
+    placeDropdown(this.o.input, this.o.results);
     this.o.results.querySelectorAll('li[data-i]').forEach((el) => {
       el.addEventListener('click', () => {
         if (my !== this.seq) return; // stale result

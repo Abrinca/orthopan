@@ -1,60 +1,168 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="light">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <link rel="icon" href="data:," />
     <title>OrthoPan</title>
+    <meta name="color-scheme" content="light dark" />
+    <script>
+      // set the theme before first paint to avoid a light flash
+      (function () {
+        try {
+          var s = localStorage.getItem('orthopan.theme');
+          var dark =
+            s === 'dark' ||
+            (s !== 'light' && window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+          document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+        } catch (e) {}
+      })();
+    </script>
+    <script>
+      // luma.gl reports shader compile/link failures only through console.error
+      // (deck's onError never fires). Hook it before the bundle captures
+      // console.error, and forward to window.__onShaderError when set.
+      (function () {
+        var orig = console.error.bind(console);
+        var re = /shader|compile|link|program|glsl|wgsl/i;
+        console.error = function () {
+          try {
+            var msg = Array.prototype.map
+              .call(arguments, function (a) {
+                if (a && a.message) return a.message;
+                if (typeof a === 'string') return a;
+                try {
+                  return String(a);
+                } catch (e) {
+                  return '';
+                }
+              })
+              .join(' ');
+            if (window.__onShaderError && re.test(msg)) window.__onShaderError(msg);
+          } catch (e) {}
+          return orig.apply(console, arguments);
+        };
+      })();
+    </script>
     <style>
       :root {
         --tree-w: 200px;
         --label-w: 170px;
         --track-h: 68px;
-        --border: #d0d5dd;
+      }
+      :root[data-theme='light'] {
+        color-scheme: light;
+        --bg: #ffffff;
         --panel: #f8fafc;
+        --surface: #ffffff;
+        --border: #d0d5dd;
+        --border-soft: #eef2f6;
+        --text: #1f2937;
+        --dim: #475467;
+        --faint: #667085;
+        --accent: #2563eb;
+        --accent-bg: #2563eb;
+        --accent-text: #ffffff;
+        --input-bg: #ffffff;
+        --hover: #eff4ff;
+        --tooltip-bg: rgba(17,24,39,0.92);
+        --tooltip-text: #f9fafb;
+        --tooltip-accent: #93c5fd;
+        --tooltip-dim: #cbd5e1;
+        --tooltip-border: transparent;
+        --notice: #b54708;
+        --disabled: #98a2b3;
+        --disabled-border: #e4e7ec;
+        --badge-bg: #fef0c7;
+        --badge-text: #b54708;
+        --shadow: 0 6px 18px rgba(0,0,0,0.12);
+        --shadow-panel: -4px 0 12px rgba(0,0,0,0.08);
+        --code-bg: #f2f4f7;
+        --sel-bg: #fffbeb;
+        --sel-border: #fde68a;
+      }
+      :root[data-theme='dark'] {
+        color-scheme: dark;
+        --bg: #0b1220;
+        --panel: #111827;
+        --surface: #0f172a;
+        --border: #334155;
+        --border-soft: #1f2937;
+        --text: #e5e7eb;
+        --dim: #cbd5e1;
+        --faint: #94a3b8;
+        --accent: #60a5fa;
+        --accent-bg: #2563eb;
+        --accent-text: #ffffff;
+        --input-bg: #1f2937;
+        --hover: #1e293b;
+        --tooltip-bg: rgba(2,6,23,0.95);
+        --tooltip-text: #f1f5f9;
+        --tooltip-accent: #93c5fd;
+        --tooltip-dim: #94a3b8;
+        --tooltip-border: #334155;
+        --notice: #fbbf24;
+        --disabled: #64748b;
+        --disabled-border: #334155;
+        --badge-bg: #422006;
+        --badge-text: #fbbf24;
+        --shadow: 0 6px 18px rgba(0,0,0,0.5);
+        --shadow-panel: -6px 0 22px rgba(0,0,0,0.6);
+        --code-bg: #1f2937;
+        --sel-bg: #3b2f10;
+        --sel-border: #a16207;
       }
       * { box-sizing: border-box; }
-      html, body { margin: 0; height: 100%; overflow: hidden;
-        font: 12px/1.35 system-ui, -apple-system, Segoe UI, sans-serif; color: #1f2937; }
+      html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg);
+        font: 12px/1.35 system-ui, -apple-system, Segoe UI, sans-serif; color: var(--text); }
       #app { display: flex; flex-direction: column; height: 100%; }
 
-      #topbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px; padding: 5px 10px;
+      #topbar { display: flex; flex-wrap: nowrap; align-items: center; gap: 8px 10px; padding: 5px 10px;
+        height: 42px; box-sizing: border-box; overflow-x: auto; overflow-y: hidden;
         border-bottom: 1px solid var(--border); background: var(--panel); z-index: 5; }
+      #topbar > * { flex: 0 0 auto; }
       #topbar h1 { font-size: 13px; margin: 0 8px 0 0; font-weight: 600; }
-      #topbar label { color: #475467; }
-      #topbar select, #topbar button, #topbar input { font: inherit; padding: 3px 6px; }
+      #topbar label { color: var(--dim); }
+      #topbar select, #topbar button, #topbar input,
+      .aln-controls select, .aln-controls button,
+      .drawer-head select, .drawer-head button,
+      #panel .copyid {
+        font: inherit; padding: 3px 6px; background: var(--input-bg); color: var(--text);
+        border: 1px solid var(--border); border-radius: 3px; }
       #topbar button { cursor: pointer; }
-      #status { margin-left: auto; color: #667085; white-space: nowrap; }
-      #notice { color: #b54708; white-space: nowrap; max-width: 34ch; overflow: hidden; text-overflow: ellipsis; }
+      /* fixed width so switching auto/light/dark never reflows the header */
+      #theme { width: 74px; }
+      #status { margin-left: auto; color: var(--faint); white-space: nowrap; }
+      #notice { color: var(--notice); white-space: nowrap; max-width: 34ch; overflow: hidden; text-overflow: ellipsis; }
       #legend { display: inline-flex; align-items: stretch; height: 12px; border: 1px solid var(--border);
         border-radius: 2px; overflow: hidden; vertical-align: middle; }
       #legend span { display: inline-block; min-width: 14px; line-height: 10px; font-size: 8px;
-        text-align: center; color: #1f2937; }
+        text-align: center; color: var(--text); }
       #sortbtn { display: none; }
       #sortbtn.visible { display: inline-block; }
 
       #search-wrap { position: relative; }
       #search { width: 180px; }
-      #search-results { position: absolute; top: 100%; left: 0; min-width: 300px; max-height: 340px;
-        overflow: auto; background: #fff; border: 1px solid var(--border); border-radius: 4px;
-        box-shadow: 0 6px 18px rgba(0,0,0,0.12); display: none; z-index: 30; }
+      #search-results { position: fixed; --dropdown-min: 300px; min-width: 300px; max-height: 340px;
+        overflow: auto; background: var(--surface); border: 1px solid var(--border); border-radius: 4px;
+        box-shadow: var(--shadow); display: none; z-index: 30; }
       #search-results.visible { display: block; }
-      #search-results .total { padding: 4px 8px; color: #667085; font-size: 11px; border-bottom: 1px solid #eef2f6; }
+      #search-results .total { padding: 4px 8px; color: var(--faint); font-size: 11px; border-bottom: 1px solid var(--border-soft); }
       #search-results ul { margin: 0; padding: 0; list-style: none; }
       #search-results li { padding: 4px 8px; cursor: pointer; white-space: nowrap;
         overflow: hidden; text-overflow: ellipsis; }
-      #search-results li:hover { background: #eff4ff; }
-      #search-results .field { color: #667085; }
-      #search-results .snippet { color: #475467; }
+      #search-results li:hover { background: var(--hover); }
+      #search-results .field { color: var(--faint); }
+      #search-results .snippet { color: var(--dim); }
 
       #layers { position: relative; }
-      #layers summary { cursor: pointer; color: #475467; }
-      #layer-list { position: absolute; right: 0; top: 100%; background: #fff; border: 1px solid var(--border);
-        border-radius: 4px; box-shadow: 0 6px 18px rgba(0,0,0,0.12); padding: 6px 10px; min-width: 210px;
+      #layers summary { cursor: pointer; color: var(--dim); }
+      #layer-list { position: fixed; background: var(--surface); border: 1px solid var(--border);
+        border-radius: 4px; box-shadow: var(--shadow); padding: 6px 10px; --dropdown-min: 210px; min-width: 210px;
         max-height: 360px; overflow: auto; z-index: 30; }
-      #layer-list h4 { margin: 6px 0 2px; font-size: 11px; color: #667085; }
+      #layer-list h4 { margin: 6px 0 2px; font-size: 11px; color: var(--faint); }
       #layer-list label { display: block; white-space: nowrap; }
-      #layer-list .swatch { display: inline-block; width: 10px; height: 10px; border: 1px solid rgba(0,0,0,0.15);
+      #layer-list .swatch { display: inline-block; width: 10px; height: 10px; border: 1px solid rgba(128,128,128,0.4);
         vertical-align: middle; margin-right: 4px; border-radius: 2px; }
 
       #body { display: flex; flex: 1; min-height: 0; position: relative; }
@@ -77,10 +185,11 @@
       #deck { position: absolute; inset: 0; }
       #overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
       #tooltip { position: fixed; pointer-events: none; display: none; z-index: 70;
-        background: rgba(17,24,39,0.92); color: #f9fafb; padding: 5px 7px; border-radius: 4px;
+        background: var(--tooltip-bg); color: var(--tooltip-text); padding: 5px 7px; border-radius: 4px;
+        border: 1px solid var(--tooltip-border);
         font-size: 11px; max-width: 340px; white-space: nowrap; }
-      #tooltip b { color: #93c5fd; font-weight: 600; }
-      #tooltip .tip-dim { color: #cbd5e1; }
+      #tooltip b { color: var(--tooltip-accent); font-weight: 600; }
+      #tooltip .tip-dim { color: var(--tooltip-dim); }
 
       #labels-col { width: var(--label-w); flex: 0 0 var(--label-w); position: relative;
         border-left: 1px solid var(--border); }
@@ -91,61 +200,59 @@
 
       /* detail drawer overlaying the matrix; the label column stays visible */
       #panel { position: absolute; top: 0; right: var(--label-w); bottom: 0; width: 400px;
-        background: #fff; border-left: 1px solid var(--border); box-shadow: -4px 0 12px rgba(0,0,0,0.08);
+        background: var(--surface); border-left: 1px solid var(--border); box-shadow: var(--shadow-panel);
         display: none; z-index: 20; flex-direction: column; min-width: 300px; }
       #panel.visible { display: flex; }
-      .drawer-head { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; padding: 6px 8px; border-bottom: 1px solid var(--border); }
-      .drawer-head #drawer-title { font-weight: 600; font-size: 13px; min-width: 0; max-width: 100%; overflow: hidden;
+      .drawer-head { display: flex; flex-wrap: nowrap; align-items: center; gap: 3px 4px; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+      .drawer-head #drawer-title { font-weight: 600; font-size: 13px; min-width: 0; flex: 0 1 auto; overflow: hidden;
         text-overflow: ellipsis; white-space: nowrap; }
       .drawer-head .grow { flex: 1; }
-      .drawer-head button, .drawer-head a.dl, .drawer-head select { font: inherit; padding: 2px 6px; }
-      .drawer-head a.dl { text-decoration: none; color: #2563eb; border: 1px solid var(--border); border-radius: 3px; white-space: nowrap; }
-      .drawer-head a.dl.disabled { color: #98a2b3; border-color: #e4e7ec; pointer-events: none; }
-      .drawer-head .close { border: none; background: none; font-size: 16px; cursor: pointer; }
+      .drawer-head a.dl { text-decoration: none; color: var(--accent); border: 1px solid var(--border); border-radius: 3px; white-space: nowrap; padding: 2px 6px; }
+      .drawer-head a.dl.disabled { color: var(--disabled); border-color: var(--disabled-border); pointer-events: none; }
+      .drawer-head .close { border: none; background: none; font-size: 16px; cursor: pointer; color: var(--text); }
       .navbtn { font: inherit; padding: 1px 6px; cursor: pointer; }
       .drawer-actions { padding: 8px 10px; border-bottom: 1px solid var(--border); }
-      #open-aln { font: inherit; padding: 6px 10px; background: #2563eb; color: #fff; border: none; border-radius: 4px; cursor: pointer; }
+      #open-aln { font: inherit; padding: 6px 10px; background: var(--accent-bg); color: var(--accent-text); border: none; border-radius: 4px; cursor: pointer; }
       #tab-members { overflow: auto; padding: 10px 12px; flex: 1; min-height: 0; }
       #panel h2 { font-size: 13px; margin: 10px 0 6px; }
       #panel h2:first-child { margin-top: 0; }
       #panel table { border-collapse: collapse; width: 100%; margin: 6px 0; }
-      #panel td { padding: 2px 4px; border-bottom: 1px solid #eef2f6; vertical-align: top; }
-      #panel td:first-child { color: #667085; white-space: nowrap; }
+      #panel td { padding: 2px 4px; border-bottom: 1px solid var(--border-soft); vertical-align: top; }
+      #panel td:first-child { color: var(--faint); white-space: nowrap; }
       #panel ul { margin: 4px 0 0; padding-left: 16px; }
-      #panel code { background: #f2f4f7; padding: 0 3px; border-radius: 3px; }
-      #panel .linkish { color: #2563eb; cursor: pointer; }
+      #panel code { background: var(--code-bg); padding: 0 3px; border-radius: 3px; }
+      #panel .linkish { color: var(--accent); cursor: pointer; }
       #panel .linkish:hover { text-decoration: underline; }
-      .tree-legend { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 2px 8px; font-size: 10px; color: #475467; }
+      .tree-legend { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 2px 8px; font-size: 10px; color: var(--dim); }
       .tree-legend .lg { display: inline-flex; align-items: center; gap: 3px; white-space: nowrap; }
-      .tree-legend .lg i { display: inline-block; width: 9px; height: 9px; border: 1px solid rgba(0,0,0,0.2); border-radius: 1px; }
-      .tree-legend .lg i.dup { background: #fff; border: 1.4px solid #111827; border-radius: 0; transform: rotate(45deg); width: 7px; height: 7px; margin: 0 2px; }
+      .tree-legend .lg i { display: inline-block; width: 9px; height: 9px; border: 1px solid rgba(128,128,128,0.4); border-radius: 1px; }
+      .tree-legend .lg i.dup { background: var(--surface); border: 1.4px solid var(--text); border-radius: 0; transform: rotate(45deg); width: 7px; height: 7px; margin: 0 2px; }
       #panel .genome-list { padding-left: 0; list-style: none; }
       #panel .genome-group { margin: 6px 0; }
-      #panel .genome-group > b { color: #111827; }
+      #panel .genome-group > b { color: var(--text); }
       #panel .genome-group ul { padding-left: 16px; }
       #panel .copyid { font-size: 10px; padding: 0 4px; margin-left: 4px; cursor: pointer; }
-      #panel .muted { color: #667085; }
-      #panel .sel-genome { background: #fffbeb; border: 1px solid #fde68a; border-radius: 4px;
+      #panel .muted { color: var(--faint); }
+      #panel .sel-genome { background: var(--sel-bg); border: 1px solid var(--sel-border); border-radius: 4px;
         padding: 6px 8px; margin: 0 0 8px; }
-      #panel .sel-genome.absent { background: #f8fafc; border-color: #e4e7ec; color: #667085; }
+      #panel .sel-genome.absent { background: var(--panel); border-color: var(--border); color: var(--faint); }
       #panel .sel-genome ul { margin: 4px 0 0; padding-left: 16px; }
-      #panel .genome-group.selected { background: #eff4ff; border-radius: 3px; }
+      #panel .genome-group.selected { background: var(--hover); border-radius: 3px; }
 
       /* full-screen alignment view (tree | colour | gene | MSA) */
-      #aln-view { position: fixed; inset: 0; z-index: 60; background: #fff; display: none; flex-direction: column; }
+      #aln-view { position: fixed; inset: 0; z-index: 60; background: var(--bg); display: none; flex-direction: column; }
       #aln-view.open { display: flex; }
-      #aln-header { flex: 0 0 auto; border-bottom: 1px solid var(--border); background: #fff; }
+      #aln-header { flex: 0 0 auto; border-bottom: 1px solid var(--border); background: var(--bg); }
       .aln-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; padding: 4px 8px; }
-      .aln-controls label { color: #475467; }
-      .aln-controls button, .aln-controls select, .aln-controls a.dl { font: inherit; padding: 2px 6px; }
-      .aln-controls a.dl { text-decoration: none; color: #2563eb; border: 1px solid var(--border); border-radius: 3px; white-space: nowrap; }
-      .aln-controls a.dl.disabled { color: #98a2b3; border-color: #e4e7ec; pointer-events: none; }
-      #aln-badges .badge { font-size: 10px; padding: 1px 5px; border-radius: 8px; background: #fef0c7; color: #b54708; }
-      #aln-badges .badge.src { background: #eef2f6; color: #475467; }
-      #aln-status { color: #667085; }
+      .aln-controls label { color: var(--dim); }
+      .aln-controls a.dl { text-decoration: none; color: var(--accent); border: 1px solid var(--border); border-radius: 3px; white-space: nowrap; padding: 2px 6px; }
+      .aln-controls a.dl.disabled { color: var(--disabled); border-color: var(--disabled-border); pointer-events: none; }
+      #aln-badges .badge { font-size: 10px; padding: 1px 5px; border-radius: 8px; background: var(--badge-bg); color: var(--badge-text); }
+      #aln-badges .badge.src { background: var(--border-soft); color: var(--dim); }
+      #aln-status { color: var(--faint); }
       #aln-legend { margin: 2px 8px; }
       #aln-bar { display: block; width: 100%; height: 38px; }
-      #aln-scroll { flex: 1; min-height: 0; overflow-y: auto; position: relative; background: #fff; }
+      #aln-scroll { flex: 1; min-height: 0; overflow-y: auto; position: relative; background: var(--bg); }
       #aln-rows { position: relative; }
       #aln-canvas { position: sticky; top: 0; display: block; width: 100%; }
     </style>
@@ -154,6 +261,12 @@
     <div id="app">
       <div id="topbar">
         <h1>OrthoPan</h1>
+        <label for="theme">Theme</label>
+        <select id="theme" title="Colour theme">
+          <option value="auto">auto</option>
+          <option value="light">light</option>
+          <option value="dark">dark</option>
+        </select>
         <label for="order">Order</label>
         <select id="order"></select>
         <button id="sortbtn" title="Sort orthogroups by presence contrast inside the selected clade">sort by contrast</button>

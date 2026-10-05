@@ -6,8 +6,9 @@
 // visible vertical band, so 2,000-row alignments never allocate a huge canvas.
 
 import type {GeneTreeArrays, Genome, GenomeMetadataInfo, MsaResult} from './api';
-import {layoutGeneTree, leafColor, MISSING_COLOR, treeNodeX} from './genetree';
+import {layoutGeneTree, leafColor, treeNodeX} from './genetree';
 import {clampPxPerCol, clampScrollCol, fitPxPerCol, residueColor, scrollFromBar, showLetters, visibleCols} from './msa';
+import {palette} from './theme';
 import {prepareCanvas} from './transform';
 
 // --- constants --------------------------------------------------------------
@@ -440,7 +441,8 @@ export class AlignmentView {
     const cssH = this.canvas.clientHeight;
     const ctx = prepareCanvas(this.canvas, cssW, cssH);
     if (!ctx) return;
-    ctx.fillStyle = '#ffffff';
+    const pal = palette();
+    ctx.fillStyle = pal.bg;
     ctx.fillRect(0, 0, cssW, cssH);
     const c = this.content;
     if (!c) return;
@@ -454,7 +456,7 @@ export class AlignmentView {
       ctx.beginPath();
       ctx.rect(0, 0, ALN_TREE_W, cssH);
       ctx.clip();
-      ctx.fillStyle = '#98a2b3';
+      ctx.fillStyle = pal.missing;
       ctx.font = '11px system-ui, sans-serif';
       ctx.textBaseline = 'top';
       let ty = 6;
@@ -469,7 +471,7 @@ export class AlignmentView {
       ctx.beginPath();
       ctx.rect(ALN_MSA_X, 0, msaW, cssH);
       ctx.clip();
-      ctx.fillStyle = '#98a2b3';
+      ctx.fillStyle = pal.missing;
       ctx.font = '11px system-ui, sans-serif';
       ctx.textBaseline = 'top';
       let my = 6;
@@ -492,20 +494,20 @@ export class AlignmentView {
       const r = c.rows[i];
       const rowGenome = r.genomeRow >= 0 ? c.genomes[r.genomeRow]?.name ?? r.genome : r.genome;
       if (rowGenome && selected.has(rowGenome)) {
-        ctx.fillStyle = 'rgba(245,158,11,0.14)';
+        ctx.fillStyle = pal.selectionTint;
         ctx.fillRect(0, y, cssW, ALN_ROW_H);
       }
       if (i === this.hoverRow) {
-        ctx.fillStyle = 'rgba(37,99,235,0.10)';
+        ctx.fillStyle = pal.hoverTint;
         ctx.fillRect(0, y, cssW, ALN_ROW_H);
       }
-      const gcol = r.genomeRow >= 0 ? leafColor(c.genomes[r.genomeRow], c.spec) : MISSING_COLOR;
+      const gcol = r.genomeRow >= 0 ? leafColor(c.genomes[r.genomeRow], c.spec, pal.theme) : pal.missing;
       ctx.fillStyle = gcol;
       ctx.fillRect(ALN_TREE_W, y, ALN_COLOR_W - 2, ALN_ROW_H - 1);
-      ctx.fillStyle = '#1f2937';
+      ctx.fillStyle = pal.alnName;
       const name = c.idMode === 'raw' ? r.raw : r.gene;
       if (name) ctx.fillText(name, nameX + 4, y + ALN_ROW_H / 2, ALN_NAME_W - 8);
-      ctx.fillStyle = '#f3f4f6';
+      ctx.fillStyle = pal.alnMsaBg;
       ctx.fillRect(0, y + ALN_ROW_H - 1, cssW, 1);
     }
     // pass 2: MSA residues with a single clip (cheap for tall alignments)
@@ -524,7 +526,7 @@ export class AlignmentView {
         const rowGenome = r.genomeRow >= 0 ? c.genomes[r.genomeRow]?.name ?? r.genome : r.genome;
         // leave the selection tint visible through the gaps
         if (!(rowGenome && selected.has(rowGenome))) {
-          ctx.fillStyle = '#f3f4f6';
+          ctx.fillStyle = pal.alnMsaBg;
           ctx.fillRect(ALN_MSA_X, y, msaW, ALN_ROW_H - 1);
         }
         for (let col = c0; col < c1; col++) {
@@ -532,10 +534,10 @@ export class AlignmentView {
           if (res === '-') continue;
           const x = ALN_MSA_X + (col - this.scrollCol) * this.pxPerCol;
           const w = Math.max(1, this.pxPerCol);
-          ctx.fillStyle = residueColor(res);
+          ctx.fillStyle = residueColor(res, pal.theme);
           ctx.fillRect(x, y, w, ALN_ROW_H - 1);
           if (letters) {
-            ctx.fillStyle = '#1f2937';
+            ctx.fillStyle = pal.residueLetter;
             ctx.fillText(res, x + this.pxPerCol / 2, y + ALN_ROW_H / 2);
           }
         }
@@ -560,12 +562,13 @@ export class AlignmentView {
       return leafY * ALN_ROW_H + ALN_ROW_H / 2 - S;
     };
     const margin = ALN_ROW_H * 2;
+    const pal = palette();
     ctx.save();
     ctx.beginPath();
     ctx.rect(0, 0, treeW, cssH);
     ctx.clip();
     ctx.lineWidth = 1;
-    ctx.strokeStyle = '#475569';
+    ctx.strokeStyle = pal.treeLine;
     ctx.beginPath();
     for (let i = 0; i < layout.n; i++) {
       const top = layout.lo[i] * ALN_ROW_H - S;
@@ -588,7 +591,7 @@ export class AlignmentView {
     // dotted leaders from tip to the colour column
     ctx.save();
     ctx.setLineDash([2, 3]);
-    ctx.strokeStyle = '#cbd5e1';
+    ctx.strokeStyle = pal.missing;
     ctx.beginPath();
     for (let i = 0; i < layout.n; i++) {
       if (layout.leafIndex[i] < 0) continue;
@@ -612,9 +615,9 @@ export class AlignmentView {
       ctx.lineTo(x, y + 4);
       ctx.lineTo(x - 4, y);
       ctx.closePath();
-      ctx.fillStyle = '#fff';
+      ctx.fillStyle = pal.alnDupFill;
       ctx.fill();
-      ctx.strokeStyle = '#111827';
+      ctx.strokeStyle = pal.alnDupStroke;
       ctx.lineWidth = 1.4;
       ctx.stroke();
       ctx.lineWidth = 1;
@@ -623,7 +626,7 @@ export class AlignmentView {
   }
 
   private drawGuides(ctx: CanvasRenderingContext2D, cssH: number): void {
-    ctx.strokeStyle = '#e4e7ec';
+    ctx.strokeStyle = palette().alnBorder;
     ctx.beginPath();
     ctx.moveTo(ALN_TREE_W + 0.5, 0);
     ctx.lineTo(ALN_TREE_W + 0.5, cssH);
@@ -639,9 +642,10 @@ export class AlignmentView {
     const cssH = this.bar.clientHeight;
     const ctx = prepareCanvas(this.bar, cssW, cssH);
     if (!ctx) return;
-    ctx.fillStyle = '#f8fafc';
+    const pal = palette();
+    ctx.fillStyle = pal.alnBarBg;
     ctx.fillRect(0, 0, cssW, cssH);
-    ctx.fillStyle = '#475467';
+    ctx.fillStyle = pal.alnBarLabel;
     ctx.font = '10px system-ui, sans-serif';
     ctx.textBaseline = 'middle';
     ctx.fillText('tree', 6, 12);
@@ -652,27 +656,28 @@ export class AlignmentView {
     const [c0, c1] = visibleCols(this.scrollCol, msaW, this.pxPerCol, c.msaLength);
     const cons = c.conservation;
     const gap = c.gap!;
+    const [cr, cg, cb] = pal.alnCons;
+    const [gr, gg, gb] = pal.alnGapBar;
     for (let col = c0; col < c1; col++) {
       const x = ALN_MSA_X + (col - this.scrollCol) * this.pxPerCol;
       const w = Math.max(1, this.pxPerCol);
-      const g = Math.round(60 + 170 * cons[col]);
-      ctx.fillStyle = `rgb(${Math.round(g * 0.7)},${g},${Math.round(g * 0.7)})`;
+      ctx.fillStyle = `rgba(${cr},${cg},${cb},${0.15 + 0.85 * cons[col]})`;
       ctx.fillRect(x, CONS_Y, w, CONS_H);
       if (gap[col] > 0.005) {
-        ctx.fillStyle = `rgba(146,64,14,${0.25 + 0.65 * Math.min(1, gap[col])})`;
+        ctx.fillStyle = `rgba(${gr},${gg},${gb},${0.25 + 0.65 * Math.min(1, gap[col])})`;
         ctx.fillRect(x, GAP_Y, w, GAP_H);
       }
     }
     // overview strip
-    ctx.fillStyle = '#eef2f6';
+    ctx.fillStyle = pal.alnOverviewTrack;
     ctx.fillRect(ALN_MSA_X, SB_Y, msaW, SB_H);
     const viewportCols = msaW / this.pxPerCol;
     const handleW = Math.max(8, msaW * Math.min(1, viewportCols / Math.max(1, c.msaLength)));
     const maxScroll = Math.max(0, c.msaLength - viewportCols);
     const frac = maxScroll > 0 ? this.scrollCol / maxScroll : 0;
-    ctx.fillStyle = '#94a3b8';
+    ctx.fillStyle = pal.alnOverviewHandle;
     ctx.fillRect(ALN_MSA_X + Math.min(msaW - handleW, frac * (msaW - handleW)), SB_Y, handleW, SB_H);
-    ctx.strokeStyle = '#e4e7ec';
+    ctx.strokeStyle = pal.alnBorder;
     ctx.beginPath();
     ctx.moveTo(ALN_MSA_X + 0.5, 0);
     ctx.lineTo(ALN_MSA_X + 0.5, cssH);

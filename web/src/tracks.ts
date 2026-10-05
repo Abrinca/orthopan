@@ -3,9 +3,10 @@
 
 import type {AnnotationTrackResult, TrackInfo, TracksResult} from './api';
 import {annotationStripColor} from './annotations';
+import type {Theme} from './theme';
+import {paletteFor} from './theme';
 import {prepareCanvas, type Transform} from './transform';
 
-const PALETTE = ['#2563eb', '#059669', '#d97706'];
 const LABEL_H = 13;
 
 export function fmt3(v: number): string {
@@ -68,11 +69,12 @@ export function stripValue(strip: Strip, i: number): number {
 export class Tracks {
   constructor(private canvas: HTMLCanvasElement) {}
 
-  draw(tr: Transform, strips: Strip[], pw: number, ph: number): void {
+  draw(tr: Transform, strips: Strip[], pw: number, ph: number, theme: Theme = 'light'): void {
     const ctx = prepareCanvas(this.canvas, pw, ph);
     if (!ctx) return;
     const n = strips.length;
     if (!n) return;
+    const pal = paletteFor(theme);
     const band = ph / n;
     ctx.save();
     ctx.beginPath();
@@ -80,15 +82,15 @@ export class Tracks {
     ctx.clip();
     strips.forEach((strip, t) => {
       const top = t * band;
-      ctx.fillStyle = t % 2 ? '#fbfcfe' : '#f5f8fc';
+      ctx.fillStyle = t % 2 ? pal.trackBgB : pal.trackBgA;
       ctx.fillRect(0, top, pw, band);
-      ctx.strokeStyle = '#e4e7ec';
+      ctx.strokeStyle = pal.trackBorder;
       ctx.beginPath();
       ctx.moveTo(0, top + 0.5);
       ctx.lineTo(pw, top + 0.5);
       ctx.stroke();
-      if (strip.kind === 'category') this.drawCategory(ctx, tr, strip, top, band, pw);
-      else this.drawNumeric(ctx, tr, strip, top, band, pw, t);
+      if (strip.kind === 'category') this.drawCategory(ctx, tr, strip, top, band, pw, theme);
+      else this.drawNumeric(ctx, tr, strip, top, band, pw, t, theme);
     });
     ctx.restore();
   }
@@ -101,14 +103,16 @@ export class Tracks {
     band: number,
     pw: number,
     t: number,
+    theme: Theme,
   ): void {
+    const pal = paletteFor(theme);
     const L = strip.world.og1 - strip.world.og0;
     const src = strip.result.names.indexOf(strip.name);
     if (src < 0) return;
     const values = strip.result.data.subarray(src * strip.result.bins, (src + 1) * strip.result.bins);
     const [lo, hi] = robustDomain(values, strip.info);
     const span = hi - lo || 1;
-    ctx.fillStyle = PALETTE[t % PALETTE.length];
+    ctx.fillStyle = pal.trackBars[t % pal.trackBars.length];
     const base = top + band - 3;
     const maxBar = band - LABEL_H - 2;
     for (let i = 0; i < strip.result.bins; i++) {
@@ -120,7 +124,7 @@ export class Tracks {
       const r = Math.min(1, Math.max(0, (v - lo) / span));
       ctx.fillRect(x0, base - Math.max(1, r * maxBar), Math.max(1, x1 - x0), Math.max(1, r * maxBar));
     }
-    ctx.fillStyle = '#344054';
+    ctx.fillStyle = pal.trackLabel;
     ctx.font = '10px system-ui, sans-serif';
     ctx.textBaseline = 'top';
     ctx.fillText(`${strip.name}  ${fmt3(lo)}–${fmt3(hi)}`, 4, top + 1);
@@ -133,7 +137,9 @@ export class Tracks {
     top: number,
     band: number,
     pw: number,
+    theme: Theme,
   ): void {
+    const pal = paletteFor(theme);
     const L = strip.world.og1 - strip.world.og0;
     const y = top + LABEL_H;
     const h = Math.max(1, band - LABEL_H - 1);
@@ -143,10 +149,10 @@ export class Tracks {
       const x0 = tr.xOf(strip.world.og0 + (i * L) / strip.result.bins);
       const x1 = tr.xOf(strip.world.og0 + ((i + 1) * L) / strip.result.bins);
       if (x1 < 0 || x0 > pw) continue;
-      ctx.fillStyle = annotationStripColor(v);
+      ctx.fillStyle = annotationStripColor(v, theme);
       ctx.fillRect(x0, y, Math.max(1, x1 - x0), h);
     }
-    ctx.fillStyle = '#344054';
+    ctx.fillStyle = pal.trackLabel;
     ctx.font = '10px system-ui, sans-serif';
     ctx.textBaseline = 'top';
     ctx.fillText(strip.name, 4, top + 1);

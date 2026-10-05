@@ -28,14 +28,15 @@ import {
 import {annotationCategory, categoryColor} from './annotations';
 import {AlignmentView, orderAlignmentRows, locateOg, stepPosition, type AlnContent, type AlnHover, type AlnBarHover} from './alignment';
 import {formatCopiesExact, formatCopiesMean} from './decode';
-import {MISSING_COLOR} from './genetree';
 import {Generation, Sequence} from './generation';
-import {Heatmap, colorForValue, copiesLegend, toImageDataFor} from './matrix';
+import {Heatmap, colorForValue, copiesLegend, toImageDataFor, FLAT_TILE, tileParams as tileParamsFor, type TileParams} from './matrix';
 import {Metadata, META_COL_W, numericColor} from './metadata';
 import {computeConservation} from './msa';
 import {memberSlice, type MemberGroup} from './members';
 import {PendingCache} from './pending';
+import {needsFetch, requestKeys} from './requestkey';
 import {decodeSelection, encodeSelection, rangeSelection, selectionNames, singleSelection, summarizeSelection, type GenomeSelection} from './selection';
+import {currentTheme, getThemeSetting, initTheme, onThemeChange, palette, setThemeSetting, type ThemeSetting} from './theme';
 import {SearchBox, hitViewport} from './search';
 import {
   binRange,
@@ -54,6 +55,7 @@ import {
 } from './transform';
 import {Tracks, fmt3, type Strip} from './tracks';
 import {Tree} from './tree';
+import {placeDropdown, trackDropdown} from './dropdown';
 
 const $ = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T;
 
@@ -99,11 +101,13 @@ const alnDlAligned = $<HTMLAnchorElement>('aln-dl-aligned');
 const alnDlNwk = $<HTMLAnchorElement>('aln-dl-nwk');
 const orderSelect = $<HTMLSelectElement>('order');
 const modeSelect = $<HTMLSelectElement>('mode');
+const themeSelect = $<HTMLSelectElement>('theme');
 const treeShapeSelect = $<HTMLSelectElement>('tree-shape');
 const sortBtn = $<HTMLButtonElement>('sortbtn');
 const statusEl = $('status');
 const noticeEl = $('notice');
 const legendEl = $('legend');
+const layersEl = $('layers');
 const layerList = $('layer-list');
 const searchInput = $<HTMLInputElement>('search');
 const searchResults = $('search-results');
@@ -130,6 +134,9 @@ let lastTracks: TracksResult | null = null;
 let lastTracksWorld: {og0: number; og1: number} | null = null;
 let lastAnnos: AnnotationTrackResult[] | null = null;
 let lastAnnoWorld: {og0: number; og1: number} | null = null;
+// request keys so an unchanged window/order/value is not fetched again
+let lastMatrixKey: string | null = null;
+let lastTracksKey: string | null = null;
 let hover: {row: number; col: number} | null = null;
 let highlight: {pos: number; until: number} | null = null;
 
@@ -243,6 +250,37 @@ function dims(): {pw: number; ph: number} {
   return {pw: matrixWrap.clientWidth, ph: matrixWrap.clientHeight};
 }
 
+/** Rounded-tile params for the live viewport; read every deck.gl frame. */
+function heatmapTileParams(): TileParams {
+  if (!lastWin || !lastMat) return FLAT_TILE;
+  const binnedX = lastWin.w < lastWin.og1 - lastWin.og0;
+  const binnedY = lastWin.h < lastWin.g1 - lastWin.g0;
+  const dpr = window.devicePixelRatio || 1;
+  return tileParamsFor(2 ** view.zx, 2 ** view.zy, [lastWin.w, lastWin.h], !binnedX && !binnedY, dpr, palette().absentDarken);
+}
+
+/** Re-rasterise the current matrix window for the active theme (no refetch). */
+function refreshHeatmapRaster(): void {
+  if (!lastMat || !lastWin || !heatmap) return;
+  heatmap.setData(
+    toImageDataFor(lastMat.value, lastMat.data, lastMat.width, lastMat.height, currentTheme()),
+    [lastWin.og0, lastWin.g1, lastWin.og1, lastWin.g0],
+    heatmapTileParams,
+  );
+}
+
+/** Redraw every themed surface after a light/dark change. */
+function applyTheme(): void {
+  setupLegend();
+  if (meta) {
+    renderTreeLegend(alnLegend, treeField);
+    populateLayers(meta);
+  }
+  refreshHeatmapRaster();
+  if (meta) render();
+  alignmentView?.draw();
+}
+
 const esc = (s: string) =>
   s.replace(/[&<>"]/g, (c) => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'})[c] as string);
 
@@ -258,6 +296,7 @@ function notice(msg: string): void {
 // --- initialization ---------------------------------------------------------
 
 async function boot(): Promise<void> {
+  initTheme();
   meta = await getMeta();
   genomes = await getGenomes();
   tree = new Tree(treeCanvas);
@@ -374,7 +413,7 @@ function populateLayers(m: Meta): void {
     for (const a of cats) {
       const swatches = (a.categories ?? [])
         .slice(0, 8)
-        .map((c, i) => `<span class="swatch" style="background:${categoryColor(i)}" title="${esc(c)}"></span>`)
+        .map((c, i) => `<span class="swatch" style="background:${categoryColor(i, currentTheme())}" title="${esc(c)}"></span>`)
         .join('');
       boxes.push(
         `<label><input type="checkbox" data-kind="anno" value="${esc(a.name)}" ${activeAnnos.includes(a.name) ? 'checked' : ''}/> ${esc(a.name)} ${swatches}</label>`,
@@ -418,6 +457,9 @@ function setOrder(o: string): void {
   lastTracksWorld = null;
   lastAnnos = null;
   lastAnnoWorld = null;
+  // the displayed state was cleared: never dedupe the next request against it
+  lastMatrixKey = null;
+  lastTracksKey = null;
   hover = null;
   hideTooltip();
   navSeq.invalidate(); // in-flight prev/next must not apply after a reorder
@@ -464,45 +506,81 @@ async function fetchData(): Promise<void> {
   const {pw, ph} = dims();
   if (pw < 2 || ph < 2) return;
   const win = computeWindow(view, meta.n_orthogroups, meta.n_genomes, pw, ph);
+  const keys = requestKeys(snapOrder, snapMode, win, activeTracks, activeAnnos);
+  const hasMatrix = lastMat !== null && dataOrder === snapOrder;
+  const {matrix: needMatrix, tracks: needTracks} = needsFetch(keys, lastMatrixKey, lastTracksKey, hasMatrix);
+  const setStatus = () => {
+    if (lastMat) statusEl.textContent = `${lastMat.width}×${lastMat.height} cells · ${order} · ${lastMat.value}`;
+  };
+  if (!needMatrix && !needTracks) {
+    // an unchanged window/order/value/layers set: nothing to fetch
+    setStatus();
+    render();
+    return;
+  }
   const ac = new AbortController();
   inflight = ac;
-  statusEl.textContent = 'loading…';
-  try {
-    const m = await getMatrix({order: snapOrder, value: snapMode, ...win}, ac.signal);
-    if (myGen !== gen || ac.signal.aborted) return;
-    lastMat = m;
-    lastWin = win;
-    dataOrder = snapOrder;
-    heatmap.setData(toImageDataFor(m.value, m.data, m.width, m.height), [win.og0, win.g1, win.og1, win.g0]);
-    statusEl.textContent = `${m.width}×${m.height} cells · ${snapOrder} · ${m.value}`;
-    render();
+  const aborted = () => myGen !== gen || ac.signal.aborted;
+  const tasks: Promise<void>[] = [];
 
-    const [tr, annos] = await Promise.all([
-      activeTracks.length
-        ? getTracks({order: snapOrder, og0: win.og0, og1: win.og1, w: win.w, names: activeTracks}, ac.signal)
-        : Promise.resolve(null),
-      Promise.all(
-        activeAnnos.map((name) =>
-          getAnnotationTrack({order: snapOrder, og0: win.og0, og1: win.og1, w: win.w, name}, ac.signal).catch(() => null),
-        ),
-      ),
-    ]);
-    if (myGen !== gen || ac.signal.aborted) return;
-    lastTracks = tr;
-    lastTracksWorld = tr ? {og0: win.og0, og1: win.og1} : null;
-    lastAnnos = annos.filter((a): a is AnnotationTrackResult => a !== null);
-    lastAnnoWorld = lastAnnos.length ? {og0: win.og0, og1: win.og1} : null;
-    render();
-    void ensureOgNames(snapOrder, win, ac.signal, myGen);
-  } catch (err) {
-    if (ac.signal.aborted || myGen !== gen) return;
-    if (err instanceof HttpError && err.status === 404 && snapOrder !== 'tree') {
-      notice(`unknown order '${snapOrder}' — using tree`);
-      setOrder('tree');
-      return;
-    }
-    statusEl.textContent = `error: ${(err as Error).message}`;
+  if (needMatrix) {
+    statusEl.textContent = 'loading…';
+    tasks.push(
+      (async () => {
+        try {
+          const m = await getMatrix({order: snapOrder, value: snapMode, ...win}, ac.signal);
+          if (aborted()) return;
+          lastMat = m;
+          lastWin = win;
+          dataOrder = snapOrder;
+          lastMatrixKey = keys.matrix;
+          heatmap.setData(toImageDataFor(m.value, m.data, m.width, m.height, currentTheme()), [win.og0, win.g1, win.og1, win.g0], heatmapTileParams);
+          setStatus();
+          render();
+        } catch (err) {
+          if (ac.signal.aborted || myGen !== gen) return;
+          if (err instanceof HttpError && err.status === 404 && snapOrder !== 'tree') {
+            notice(`unknown order '${snapOrder}' — using tree`);
+            setOrder('tree');
+            return;
+          }
+          statusEl.textContent = `error: ${(err as Error).message}`;
+        }
+      })(),
+    );
   }
+
+  if (needTracks) {
+    tasks.push(
+      (async () => {
+        try {
+          const [tr, annos] = await Promise.all([
+            activeTracks.length
+              ? getTracks({order: snapOrder, og0: win.og0, og1: win.og1, w: win.w, names: activeTracks}, ac.signal)
+              : Promise.resolve(null),
+            Promise.all(
+              activeAnnos.map((name) =>
+                getAnnotationTrack({order: snapOrder, og0: win.og0, og1: win.og1, w: win.w, name}, ac.signal).catch(() => null),
+              ),
+            ),
+          ]);
+          if (aborted()) return;
+          lastTracks = tr;
+          lastTracksWorld = tr ? {og0: win.og0, og1: win.og1} : null;
+          lastAnnos = annos.filter((a): a is AnnotationTrackResult => a !== null);
+          lastAnnoWorld = lastAnnos.length ? {og0: win.og0, og1: win.og1} : null;
+          lastTracksKey = keys.tracks;
+          render();
+        } catch {
+          /* tracks are optional */
+        }
+      })(),
+    );
+  }
+
+  // labels/OG names do not depend on the matrix fetch or the GL frame
+  tasks.push(ensureOgNames(snapOrder, win, ac.signal, myGen));
+  await Promise.all(tasks);
 }
 
 async function ensureOgNames(
@@ -627,10 +705,11 @@ function render(): void {
   const {pw, ph} = dims();
   if (pw < 2 || ph < 2) return;
   const tr = makeTransform(view, pw, ph);
-  tree.draw(tr, treeCanvas.clientWidth, treeCanvas.clientHeight);
+  const theme = currentTheme();
+  tree.draw(tr, treeCanvas.clientWidth, treeCanvas.clientHeight, theme);
   stripsForHit = buildStrips();
-  tracks.draw(tr, stripsForHit, tracksCanvas.clientWidth, tracksCanvas.clientHeight);
-  if (metaFields.length) metadata.draw(tr, genomes, metaFields, metaCanvas.clientWidth, metaCanvas.clientHeight);
+  tracks.draw(tr, stripsForHit, tracksCanvas.clientWidth, tracksCanvas.clientHeight, theme);
+  if (metaFields.length) metadata.draw(tr, genomes, metaFields, metaCanvas.clientWidth, metaCanvas.clientHeight, theme);
   drawLabels(tr, labelsCanvas.clientWidth, labelsCanvas.clientHeight);
   drawOverlay(tr, pw, ph);
   updateSortButton();
@@ -647,7 +726,7 @@ function syncLabelColumn(): void {
 function drawCladeTint(ctx: CanvasRenderingContext2D, tr: ReturnType<typeof makeTransform>, pw: number): void {
   const range = tree.selectedRange;
   if (!range) return;
-  ctx.fillStyle = 'rgba(37,99,235,0.12)';
+  ctx.fillStyle = palette().cladeTint;
   const y0 = tr.yOf(range[0]);
   const y1 = tr.yOf(range[1] + 1);
   ctx.fillRect(0, y0, pw, y1 - y0);
@@ -662,7 +741,7 @@ function drawLabels(tr: ReturnType<typeof makeTransform>, pw: number, ph: number
   const r1 = Math.min(meta.n_genomes - 1, Math.ceil(tr.rowAt(ph)) + 1);
   ctx.font = '11px system-ui, sans-serif';
   ctx.textBaseline = 'middle';
-  ctx.fillStyle = '#344054';
+  ctx.fillStyle = palette().genomeLabel;
   for (let r = r0; r <= r1; r++) {
     const y = tr.yOf(r + 0.5);
     if (y < -8 || y > ph + 8) continue;
@@ -676,27 +755,34 @@ function drawOverlay(tr: ReturnType<typeof makeTransform>, pw: number, ph: numbe
 
   drawCladeTint(ctx, tr, pw);
 
+  const pal = palette();
   // search-hit highlight
   if (highlight && performance.now() < highlight.until) {
     const x0 = tr.xOf(highlight.pos);
     const x1 = tr.xOf(highlight.pos + 1);
-    ctx.fillStyle = 'rgba(37,99,235,0.20)';
+    ctx.fillStyle = pal.searchFill;
     ctx.fillRect(x0, 0, Math.max(1, x1 - x0), ph);
-    ctx.strokeStyle = 'rgba(37,99,235,0.9)';
+    ctx.strokeStyle = pal.searchStroke;
     ctx.strokeRect(x0 + 0.5, 0.5, Math.max(1, x1 - x0), ph - 1);
   }
 
   if (activeOgs && activeOgs.order === order && tr.sx >= 24) {
     ctx.font = '10px system-ui, sans-serif';
-    ctx.fillStyle = '#475467';
     ctx.textAlign = 'left';
     ctx.textBaseline = 'middle';
+    ctx.lineJoin = 'round';
+    ctx.miterLimit = 2;
     for (let i = 0; i < activeOgs.ids.length; i++) {
       const x = tr.xOf(activeOgs.og0 + i + 0.5);
       if (x < 0 || x > pw) continue;
       ctx.save();
       ctx.translate(x, 2);
       ctx.rotate(Math.PI / 2);
+      // bg-coloured halo keeps the rotated label legible over any cell colour
+      ctx.lineWidth = 3;
+      ctx.strokeStyle = pal.bg;
+      ctx.strokeText(activeOgs.ids[i], 0, 0);
+      ctx.fillStyle = pal.text;
       ctx.fillText(activeOgs.ids[i], 0, 0);
       ctx.restore();
     }
@@ -705,15 +791,42 @@ function drawOverlay(tr: ReturnType<typeof makeTransform>, pw: number, ph: numbe
 
   if (hover && lastWin) {
     const [x, y, w, h] = cellRect(lastWin, tr, hover.col, hover.row);
-    ctx.strokeStyle = 'rgba(17,24,39,0.7)';
+    const tp = heatmapTileParams();
+    ctx.strokeStyle = palette().hoverOutline;
     ctx.lineWidth = 1;
-    ctx.strokeRect(x + 0.5, y + 0.5, w, h);
+    if (tp.mix > 0.5) {
+      // match the rounded tile
+      const dpr = window.devicePixelRatio || 1;
+      const ix = tp.gap[0] / 2 / dpr;
+      const iy = tp.gap[1] / 2 / dpr;
+      const r = Math.min(tp.radius / dpr, Math.max(0, Math.min(w - 2 * ix, h - 2 * iy) / 2));
+      roundRectPath(ctx, x + ix, y + iy, w - 2 * ix, h - 2 * iy, r);
+      ctx.stroke();
+    } else {
+      ctx.strokeRect(x + 0.5, y + 0.5, w, h);
+    }
   }
 }
 
+function roundRectPath(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number): void {
+  const rr = Math.max(0, Math.min(r, Math.min(w, h) / 2));
+  ctx.beginPath();
+  ctx.moveTo(x + rr, y);
+  ctx.lineTo(x + w - rr, y);
+  ctx.arcTo(x + w, y, x + w, y + rr, rr);
+  ctx.lineTo(x + w, y + h - rr);
+  ctx.arcTo(x + w, y + h, x + w - rr, y + h, rr);
+  ctx.lineTo(x + rr, y + h);
+  ctx.arcTo(x, y + h, x, y + h - rr, rr);
+  ctx.lineTo(x, y + rr);
+  ctx.arcTo(x, y, x + rr, y, rr);
+  ctx.closePath();
+}
+
 function setupLegend(): void {
+  const theme = currentTheme();
   if (mode === 'copies') {
-    legendEl.innerHTML = copiesLegend()
+    legendEl.innerHTML = copiesLegend(theme)
       .map((b) => `<span style="background:${b.color}" title="${b.label}">${b.label === 'absent' ? '' : b.label}</span>`)
       .join('');
     legendEl.title = 'Copy number: absent, 1, 2, 3, 4, 5+';
@@ -722,7 +835,7 @@ function setupLegend(): void {
   const stops: string[] = [];
   const n = 16;
   for (let i = 0; i <= n; i++) {
-    const [r, g, b] = colorForValue(Math.round((i / n) * 255));
+    const [r, g, b] = colorForValue(Math.round((i / n) * 255), theme);
     stops.push(`rgb(${r},${g},${b}) ${((i / n) * 100).toFixed(0)}%`);
   }
   legendEl.innerHTML = `<span style="width:110px;background:linear-gradient(90deg, ${stops.join(',')})"></span>`;
@@ -1032,6 +1145,17 @@ function setupDrawer(): void {
     updateDownloads();
     updateNwkLink();
   });
+  // theme setting: auto / light / dark
+  themeSelect.value = getThemeSetting();
+  themeSelect.addEventListener('change', () => setThemeSetting(themeSelect.value as ThemeSetting));
+  onThemeChange(() => applyTheme());
+  // the top bar no longer wraps; pin the Layers dropdown to the viewport
+  const layersSummary = layersEl.querySelector('summary')!;
+  const layersOpen = () => (layersEl as HTMLDetailsElement).open;
+  layersEl.addEventListener('toggle', () => {
+    if (layersOpen()) placeDropdown(layersSummary, layerList);
+  });
+  trackDropdown(layersSummary, layerList, $('topbar'), layersOpen);
   document.addEventListener('keydown', onKeyDown);
   window.addEventListener('popstate', onLocationChange);
   window.addEventListener('hashchange', onLocationChange);
@@ -1070,16 +1194,18 @@ function onKeyDown(e: KeyboardEvent): void {
 }
 
 function renderTreeLegend(el: HTMLElement, field: string): void {
+  const theme = currentTheme();
+  const missing = palette().missing;
   const spec = (meta?.genome_metadata ?? []).find((f) => f.name === field);
   let html = '';
   if (!spec || spec.kind === 'categorical') {
     const cats = (spec?.categories ?? []).slice(0, 16);
-    html = cats.map((c, i) => `<span class="lg"><i style="background:${categoryColor(i)}"></i>${esc(c)}</span>`).join('');
-    if (spec) html += `<span class="lg"><i style="background:${MISSING_COLOR}"></i>missing</span>`;
+    html = cats.map((c, i) => `<span class="lg"><i style="background:${categoryColor(i, theme)}"></i>${esc(c)}</span>`).join('');
+    if (spec) html += `<span class="lg"><i style="background:${missing}"></i>missing</span>`;
     if (!html) html = `<span class="lg">genome identity</span>`;
   } else {
-    const stops = [0, 0.25, 0.5, 0.75, 1].map((f) => `<i style="background:${numericColor(f)}"></i>`).join('');
-    html = `<span class="lg">${fmt3(spec.min ?? 0)}${stops}${fmt3(spec.max ?? 1)}</span><span class="lg"><i style="background:${MISSING_COLOR}"></i>missing</span>`;
+    const stops = [0, 0.25, 0.5, 0.75, 1].map((f) => `<i style="background:${numericColor(f, theme)}"></i>`).join('');
+    html = `<span class="lg">${fmt3(spec.min ?? 0)}${stops}${fmt3(spec.max ?? 1)}</span><span class="lg"><i style="background:${missing}"></i>missing</span>`;
   }
   html += `<span class="lg"><i class="dup"></i>duplication</span>`;
   el.innerHTML = html;

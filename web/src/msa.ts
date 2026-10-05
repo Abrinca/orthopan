@@ -2,6 +2,8 @@
 // lives in alignment.ts).
 
 import type {MsaRow} from './api';
+import type {Theme} from './theme';
+import {paletteFor} from './theme';
 
 // --- pure math --------------------------------------------------------------
 
@@ -54,15 +56,16 @@ const POLAR = new Set('STYHCNGQ'.split(''));
 
 export const GAP_COLOR = '#eceff3';
 
-/** Clustal-like residue background colour; gaps are light. */
-export function residueColor(residue: string): string {
-  if (residue === '-' || residue === '.' || residue === ' ') return GAP_COLOR;
+/** Clustal-like residue background colour; gaps take the theme gap colour. */
+export function residueColor(residue: string, theme: Theme = 'light'): string {
+  const c = paletteFor(theme).residue;
+  if (residue === '-' || residue === '.' || residue === ' ') return paletteFor(theme).gapResidue;
   const r = residue.toUpperCase();
-  if (HYDROPHOBIC.has(r)) return '#7fa8d9';
-  if (ACIDIC.has(r)) return '#e08bb0';
-  if (BASIC.has(r)) return '#e06666';
-  if (POLAR.has(r)) return '#8fce8f';
-  return '#f0c869';
+  if (HYDROPHOBIC.has(r)) return c.hydro;
+  if (ACIDIC.has(r)) return c.acid;
+  if (BASIC.has(r)) return c.basic;
+  if (POLAR.has(r)) return c.polar;
+  return c.other;
 }
 
 /** Conservation (most-common share of non-gap) and gap fraction per column. */

@@ -16,6 +16,8 @@ function fakeInput() {
     addEventListener(t: string, f: (e?: unknown) => void) {
       (listeners[t] ??= []).push(f);
     },
+    closest: () => null,
+    getBoundingClientRect: () => ({left: 0, bottom: 20}),
     fire(t: string, e: unknown = {}) {
       (listeners[t] ?? []).forEach((f) => f(e));
     },
@@ -34,6 +36,8 @@ function fakeResults() {
     classes,
     contains: () => false,
     querySelectorAll: () => [],
+    style: {} as Record<string, string>,
+    offsetWidth: 300,
   };
 }
 

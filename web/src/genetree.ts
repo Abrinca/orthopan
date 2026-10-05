@@ -3,6 +3,8 @@
 import type {GeneTreeArrays, Genome, GenomeMetadataInfo} from './api';
 import {categoryColor} from './annotations';
 import {numericColor} from './metadata';
+import type {Theme} from './theme';
+import {paletteFor} from './theme';
 
 // --- pure layout ------------------------------------------------------------
 
@@ -79,18 +81,19 @@ function hashString(s: string): number {
 export const MISSING_COLOR = '#98a2b3';
 
 /** Leaf colour from a genome metadata field, else a stable genome identity colour. */
-export function leafColor(genome: Genome | undefined, spec: GenomeMetadataInfo | undefined): string {
-  if (!genome) return MISSING_COLOR;
-  if (!spec) return categoryColor(hashString(genome.name) % 12);
+export function leafColor(genome: Genome | undefined, spec: GenomeMetadataInfo | undefined, theme: Theme = 'light'): string {
+  const missing = paletteFor(theme).missing;
+  if (!genome) return missing;
+  if (!spec) return categoryColor(hashString(genome.name) % 12, theme);
   const value = genome.metadata?.[spec.name];
-  if (value === null || value === undefined || value === '') return MISSING_COLOR;
+  if (value === null || value === undefined || value === '') return missing;
   if (spec.kind === 'categorical') {
     const idx = (spec.categories ?? []).indexOf(String(value));
-    return idx < 0 ? MISSING_COLOR : categoryColor(idx);
+    return idx < 0 ? missing : categoryColor(idx, theme);
   }
   const min = spec.min ?? 0;
   const max = spec.max ?? 1;
-  return numericColor((Number(value) - min) / (max - min || 1));
+  return numericColor((Number(value) - min) / (max - min || 1), theme);
 }
 
 // --- pure view helpers ------------------------------------------------------
