@@ -17,6 +17,12 @@ Decisions taken so far (2026-10-04). See `VISION.md` for context and `docs/anvio
 ## Scale
 
 - Reference dataset: 2,193 genomes × 50,515 orthogroups. The long-term target is 10k+ genomes.
+- Measured on a simulated 10,000 × 50,000 dataset (`scripts/simulate_pangenome.py`, 25M genes):
+  - import with `--tree`: about 52 s at about 1 GB peak memory;
+  - server: 0.8 s startup, about 0.6–1 GB memory;
+  - full-screen matrix: about 80 ms for presence and about 100 ms for copies;
+  - first use of an order: ≤230 ms.
+  Without `--tree`, the UPGMA fallback needs about 1 GB.
 - The **data layer is designed for 10k+ from the start**: sparse Parquet, bit-packed presence/absence, and a backend that serves windowed slices and zoomed-out aggregates.
 - The **renderer starts simple**: it draws only the visible window and requests aggregates from the backend when zoomed out. Server-side tiling can be added later behind the same API.
 
@@ -52,9 +58,11 @@ Decisions taken so far (2026-10-04). See `VISION.md` for context and `docs/anvio
 
 ## Single-orthogroup view (v2)
 
-- The detail panel expands into a wide drawer with three tabs: Members, MSA and Gene tree. The matrix stays visible.
-- MSA viewer: our own canvas viewer with no dependencies. Rows are grouped by genome in tree order and residues are coloured. It has a conservation/gap bar, horizontal scroll and zoom, and row labels.
-- Gene tree: rectangular layout, with leaves coloured by a selectable genome metadata field. Duplication nodes come from `Duplications.tsv`.
+- The detail drawer (Members tab) shows the orthogroup's members grouped by genome. The clicked genome, or the binned row range, appears at the top as "In genome X: N genes" or "absent in X". Lists with more than 400 genes are paginated.
+- "Open alignment view" opens a full-screen view (`#og=…&view=aln`). Columns are gene tree | metadata colours | gene name | MSA, one 16 px row per gene, scrolled with the page. Only the visible band is drawn, so the canvases stay under browser size limits. Rows follow the gene tree's leaf order, or genome tree order when there is no gene tree.
+- MSA: our own canvas viewer with no dependencies. It has residue colours, a conservation/gap bar and an overview strip, and only the MSA scrolls horizontally.
+- Gene tree: leaves are coloured by a selectable genome metadata field, with a legend. Duplication nodes come from `Duplications.tsv`. The view switches between phylogram and cladogram.
+- ←/→ step to the previous or next orthogroup in the current matrix order, keeping the selected genome. Esc and Back return to the matrix.
 - Missing MSAs are aligned on demand with the same FAMSA command OrthoFinder uses, and the results are cached. Non-OrthoFinder inputs supply sequences via `--fasta`, indexed by byte offset.
 - Downloads: unaligned FASTA, aligned FASTA and the Newick gene tree.
 

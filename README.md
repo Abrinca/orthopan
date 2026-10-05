@@ -27,6 +27,16 @@ uv run orthopan serve out
 # open http://127.0.0.1:8000
 ```
 
+## Using the viewer
+
+- **Matrix:** genomes are rows (in genome tree order) and orthogroups are columns. The mouse wheel zooms orthogroups, Shift+wheel zooms genomes, and dragging pans.
+- **Order:** sorts the orthogroups by tree position (default), frequency or any track. Select a clade in the tree and choose "sort by contrast" to bring that clade's genes to the front.
+- **Click a cell:** the drawer shows the orthogroup's members, with the clicked genome's genes at the top. **Open alignment view** shows the gene tree, gene names and MSA side by side.
+- **Keys:** ←/→ step to the previous or next orthogroup; Esc closes the current view.
+- **Other controls:** search box, presence/copy-number toggle, layers menu for tracks and annotations, and downloads (FASTA, aligned FASTA, Newick) for each orthogroup.
+
+The URL keeps the current view, so you can bookmark or share it.
+
 ## Other inputs
 
 `orthopan import` also takes a plain orthologs TSV. This can be either a per-genome matrix or a
@@ -69,3 +79,6 @@ bun run dev     # UI dev server, proxies /api to 127.0.0.1:8000
 bun run mock    # mock API on :8000, no backend needed
 uv build        # wheel including the built UI
 ```
+
+To get a large test dataset, run `uv run python scripts/simulate_pangenome.py --help`. It writes
+a seeded, tree-structured pangenome (for example 10,000 genomes × 50,000 orthogroups).
