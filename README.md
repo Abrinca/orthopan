@@ -8,6 +8,8 @@ copy-number matrix, per-orthogroup tracks) and serves a browser UI. The UI is a 
 genomes as rows and orthogroups as columns. It has search, annotations, genome metadata, and
 per-orthogroup alignments and gene trees.
 
+![OrthoPan showing a pangenome matrix: a genome tree, annotation tracks and the presence heatmap for 1,154 genomes × 568 orthogroups](media/orthopan-matrix.png)
+
 ## Install
 
 Requires Python 3.14 and [uv](https://docs.astral.sh/uv/).
@@ -39,6 +41,10 @@ uv run orthopan serve out
 - **Other controls:** search box, presence/copy-number toggle, layers menu for tracks and annotations, and downloads (FASTA, aligned FASTA, Newick) for each orthogroup.
 
 The URL keeps the current view, so you can bookmark or share it.
+
+**Open alignment view** for one orthogroup, with the gene tree, gene names and MSA side by side:
+
+![OrthoPan alignment view for one orthogroup: gene tree, gene names and MSA side by side](media/orthopan-msa.png)
 
 ## Other inputs
 
