@@ -1,11 +1,13 @@
 [project]
 name = "orthopan"
 version = "0.1.0"
-description = "Add your description here"
+description = "Scalable, interactive viewer for pangenomes"
 readme = "README.md"
 authors = [
-    { name = "Thomas Roder", email = "roder.thomas@gmail.com" }
+    { name = "Thomas Roder", email = "thomas@abrinca.com" }
 ]
+license = "AGPL-3.0-or-later"
+license-files = ["LICENSE.md"]
 requires-python = "==3.14.*"
 dependencies = [
     "fastapi>=0.142.2",

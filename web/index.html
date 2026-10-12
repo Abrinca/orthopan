@@ -147,6 +147,11 @@
       /* fixed width so switching auto/light/dark never reflows the header */
       #theme { width: 74px; }
       #status { margin-left: auto; color: var(--faint); white-space: nowrap; }
+      #footer { display: flex; flex: 0 0 auto; align-items: center; gap: 10px;
+        padding: 3px 10px; border-top: 1px solid var(--border); background: var(--panel);
+        color: var(--faint); font-size: 11px; white-space: nowrap; overflow-x: auto; }
+      #footer a { color: var(--accent); }
+      #footer-copy { margin-left: auto; }
       #toast-container { position: fixed; left: 50%; bottom: 16px; transform: translateX(-50%);
         z-index: 80; display: flex; flex-direction: column; align-items: center; gap: 8px;
         pointer-events: none; max-width: 96vw; }
@@ -360,6 +365,10 @@
           <div id="tab-members"></div>
         </div>
       </div>
+      <footer id="footer">
+        <a href="https://github.com/Abrinca/orthopan" target="_blank" rel="noopener noreferrer">Source code</a>
+        <span id="footer-copy">OrthoPan · Copyright (C) 2026 Abrinca GmbH · AGPL-3.0-or-later</span>
+      </footer>
     </div>
     <div id="aln-view" hidden>
       <div id="aln-header">

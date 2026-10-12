@@ -1,5 +1,7 @@
 # OrthoPan
 
+[![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE.md)
+
 OrthoPan is a fast, interactive viewer for pangenomes. It imports orthogroups (for example an
 OrthoFinder results directory), builds a processed dataset (genome tree, presence/absence and
 copy-number matrix, per-orthogroup tracks) and serves a browser UI. The UI is a heatmap with
@@ -98,3 +100,12 @@ uv build                    # wheel including the built UI
 
 To get a large test dataset, run `uv run python scripts/simulate_pangenome.py --help`. It writes
 a seeded, tree-structured pangenome (for example 10,000 genomes × 50,000 orthogroups).
+
+## License
+
+OrthoPan is licensed under the [GNU Affero General Public License, version 3 or later](LICENSE.md)
+(AGPL-3.0-or-later). Copyright (C) 2026 Abrinca GmbH.
+
+The AGPL requires that users who interact with the software over a network are offered its
+source, so the viewer UI carries a "Source code" link to
+<https://github.com/Abrinca/orthopan>.
